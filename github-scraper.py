@@ -1,7 +1,7 @@
 #-------------------------------------------------------------------------------
 # MIT License
 #
-# Copyright (c) 2019 Michael Schröder, Jürgen Cito
+# Copyright (c) 2019 Michael Schröder, Jürgen Cito, Carl Egge, Stefan Schulte
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -22,9 +22,15 @@
 # SOFTWARE.
 #-------------------------------------------------------------------------------
 
-# This script implements a tool that exhaustively samples GitHub Code Search
-# results. It is written in a semi-literal style: it should be possible to read
-# through the source in a linear fashion, more or less. Enjoy.
+############################  GITHUB FILE SCRAPER  #############################
+
+# This script is a modification of the github-searcher from Michael Schröder and
+# Jürgen Cito. It exhaustively samples GitHub Code Search results and stores the 
+# files including their commit history and their content.
+
+# This script was developed by Carl Egge on behalf of the Christian Doppler Labor.
+# Its main purpose is to build a local database of Solidity smart contracts and
+# their versions.
 
 import os, sys, argparse, shutil, time, signal
 import base64, sqlite3, csv
@@ -113,6 +119,13 @@ sam = -1
 est_pop = -1
 total_sam = -1
 
+# We also want to keep track of the execution time of the script, therefore we 
+# store the starting time. And just for information we count the total amount
+# of github api calls that have been made.
+
+start = time.time()
+api_calls = 0
+
 #-------------------------------------------------------------------------------
 
 # During the search we want to display a table of all the strata sampled so far,
@@ -180,17 +193,19 @@ def update_status(msg):
 
 #-------------------------------------------------------------------------------
 
-# To access the the GitHub API, we define a little helper function that makes an
+# To access the GitHub API, we define a little helper function that makes an
 # authorized GET request and throttles the number of requests per second so as
 # not to run afoul of GitHub's rate limiting. Should a rate limiting error occur
 # nonetheless, the function waits the appropriate amount of time before
 # automatically retrying the request.
 
 def get(url, params={}):
+    global api_calls
     if args.throttle:
         time.sleep(0.72) # throttle requests to ~5000 per hour
     res = requests.get(url, params, headers=
         {'Authorization': f'token {args.github_token}'})
+    api_calls += 1
     if res.status_code == 403:
         return handle_rate_limit_error(res)
     else:
@@ -389,6 +404,10 @@ def signal_handler(sig,frame):
     db.close()
     statsfile.flush()
     statsfile.close()
+    global start
+    global api_calls
+    print("The time of execution of above program is :", time.strftime("%H:%M:%S", time.gmtime((time.time())-start)))
+    print("The program has requested " + str(api_calls) + "api calls from github")
     sys.exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
@@ -449,3 +468,5 @@ while strat_first <= args.max_size:
     print_footer()
 
 update_status('Done.')
+print("The time of execution of above program is :", time.strftime("%H:%M:%S", time.gmtime((time.time())-start)))
+print("The program has requested " + str(api_calls) + "api calls from github")
