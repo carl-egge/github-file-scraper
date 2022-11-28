@@ -280,8 +280,9 @@ def download_files_from_page(res):
 
 # This is a good place to open the connection to the results database, or create
 # one if it doesn't exist yet. The database schema follows the GitHub API
-# response schema. Our 'insert_repo' and 'insert_file' functions directly take a
-# JSON response dictionary.
+# response schema. Our 'insert_repo', 'insert_file' and 'insert_comit' functions
+# directly take a JSON response dictionary. 'commit' is a reserved keyword in 
+# sqlite, therefore the tablename is 'comit'.
 
 db = sqlite3.connect(args.database)
 db.executescript('''
@@ -299,12 +300,21 @@ db.executescript('''
     ( file_id INTEGER PRIMARY KEY
     , name TEXT NOT NULL
     , path TEXT NOT NULL
-    , size INTEGER NOT NULL
     , sha TEXT NOT NULL
-    , content TEXT NOT NULL
     , repo_id INTEGER NOT NULL
     , FOREIGN KEY (repo_id) REFERENCES repo(repo_id)
     , UNIQUE(path,repo_id)
+    );
+    CREATE TABLE IF NOT EXISTS comit
+    ( comit_id INTEGER PRIMARY KEY
+    , sha TEXT NOT NULL
+    , message TEXT NOT NULL
+    , size INTEGER NOT NULL
+    , created DATETIME DEFAULT CURRENT_TIMESTAMP
+    , content TEXT NOT NULL
+    , file_id INTEGER NOT NULL
+    , FOREIGN KEY (file_id) REFERENCES file(file_id)
+    , UNIQUE(sha,file_id)
     );
     ''')
 
@@ -330,15 +340,28 @@ def insert_repo(repo):
 def insert_file(file,repo_id):
     db.execute('''
         INSERT OR IGNORE INTO file
-            (name, path, size, sha, content, repo_id)
-        VALUES (?,?,?,?,?,?)
+            (name, path, sha, repo_id)
+        VALUES (?,?,?,?)
         ''',
         ( file['name']
         , file['path']
-        , file['size']
         , file['sha']
-        , base64.b64decode(file['content']).decode('UTF-8')
         , repo_id
+        ))
+    db.commit()
+
+def insert_commit(commit,file_id):
+    db.execute('''
+        INSERT OR IGNORE INTO commit
+            (sha, message, size, created, content, file_id)
+        VALUES (?,?,?,?,?,?)
+        ''',
+        ( commit['sha']
+        , commit['message']
+        , commit['size']
+        , commit['created'] # TODO must be format DATETIME!
+        , base64.b64decode(commit['content']).decode('UTF-8')
+        , file_id
         ))
     db.commit()
 
@@ -346,6 +369,11 @@ def known_file(item):
     cur = db.execute("select count(*) from file where path = ? and repo_id = ?", 
         (item['path'], item['repository']['id']))
     return cur.fetchone()[0] == 1
+
+def known_commit(item):
+    cur = db.execute("select count(*) from commit where sha = ? and file_id = ?", 
+        (item['sha'], item['file']['id']))
+    return cur.fetchone()[0] == 1    
 
 #-------------------------------------------------------------------------------
 
@@ -406,8 +434,8 @@ def signal_handler(sig,frame):
     statsfile.close()
     global start
     global api_calls
-    print("The time of execution of above program is :", time.strftime("%H:%M:%S", time.gmtime((time.time())-start)))
-    print("The program has requested " + str(api_calls) + "api calls from github")
+    print("The program took " + time.strftime("%H:%M:%S", time.gmtime((time.time())-start)) + " to execute (Hours:Minutes:Seconds).")
+    print("The program has requested " + str(api_calls) + " API calls from github.")
     sys.exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
@@ -468,5 +496,5 @@ while strat_first <= args.max_size:
     print_footer()
 
 update_status('Done.')
-print("The time of execution of above program is :", time.strftime("%H:%M:%S", time.gmtime((time.time())-start)))
-print("The program has requested " + str(api_calls) + "api calls from github")
+print("The program took " + time.strftime("%H:%M:%S", time.gmtime((time.time())-start)) + " to execute (Hours:Minutes:Seconds).")
+print("The program has requested " + str(api_calls) + " API calls from github.")
