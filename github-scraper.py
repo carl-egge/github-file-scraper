@@ -109,6 +109,8 @@ strat_last = min(args.min_size + args.stratum_size - 1, args.max_size)
 # ...as well as the current stratum's population and the amount of files sampled
 # so far (in the current stratum). A value of -1 indicates "unknown".
 
+# TODO: Introduce global counter for sampled of commits
+
 pop = -1
 sam = -1
 
@@ -234,12 +236,20 @@ def search(a,b,order='asc'):
                 'sort': 'indexed', 'order': order, 'per_page': 100})
 
 # To download all files returned by a code search (up to the limit of 1000
-# imposed by GitHub), we need to deal with pagination. On each page, we download
-# all files and add them and their metadata to our results database (which will
-# be set up in the next section), provided they're not already in the database
-# (which can happen when continuing a previous search). Also, if any of the
-# files can not be downloaded, for whatever reason, they are simply skipped over
-# and count as not sampled.
+# imposed by GitHub), we need to deal with pagination. On each page, we loop 
+# through all files and add them and their metadata to our results database 
+# (which will be set up in the next section), provided they're not already in 
+# the database (which can happen when continuing a previous search). 
+# 
+# For each of the files a list of commits is requested from the Github API.
+# The list of commits will again be paginated (with 100 elements per page).
+# Hence we loop over all pages and each of the commits on the pages. For a
+# commit the file content is then downloaded from the Raw Github API that 
+# has no rate limit. In the end the commits are also stored in the results
+# database, if they are not already in there.
+
+# Also, if any of the files or commits can not be downloaded, for whatever
+# reason, they are simply skipped over and count as not sampled.
 
 def download_all_files(res):
     global pop
@@ -260,14 +270,17 @@ def download_files_from_page(res):
     for item in res.json()['items']:
         if not known_file(item):
             repo = item['repository']
-            insert_repo(repo)            
-            try:
-                url = item['url'].replace('#', '%23')
-                file = get(url).json()
-            except:
-                continue
-            if file['type'] == 'file':
-                insert_file(file, repo['id'])
+            insert_repo(repo)
+            file_id = insert_file(item, repo['id'])
+            download_all_commits(item, file_id)
+            # TODO: Later we remove this code here
+            # try:
+            #     url = item['url'].replace('#', '%23')
+            #     file = get(url).json()
+            # except:
+            #     continue
+            # if file['type'] == 'file':
+            #     insert_file(file, repo['id'])
         sam += 1
         total_sam += 1
         clear_footer()
@@ -275,6 +288,48 @@ def download_files_from_page(res):
         print_footer()
         if sam >= pop:
             return
+
+def download_all_commits(item, file_id):
+    # Try to get the list of commits for this file
+    try:
+        commits_url = item['repository']['commits_url'][:-6].replace('#', '%23')
+        commits_res = get(commits_url, params={'path': item['path'], 'per_page': 100})
+    except:
+        update_status('Could not get commit history.')
+        return
+    download_commits_from_page(commits_res, item['repository']['full_name'],
+                                item['path'], file_id)
+    # TODO: Test this while loop with a search that returns more than 100 commits
+    while 'next' in commits_res.links:
+        update_status('Getting next page of commits...')
+        commits_res = get(commits_res.links['next']['url'])
+        download_commits_from_page(commits_res, item['repository']['full_name'],
+                                    item['path'], file_id)
+        # com_pop2 = commits_res.json()['total_count']
+        # com_pop = max(pop,pop2)
+        # if com_sam >= com_pop:    <- TODO: Why this?
+        #    break
+    update_status('')
+
+def download_commits_from_page(commits_res, repo_full_name, file_path, file_id):
+    update_status('Downloading commits...')
+    for commit in commits_res.json():
+        if not known_commit(commit, file_id):
+            # Try to get the file content from the raw API (no rate limit)
+            try:
+                content_res = requests.get("https://raw.githubusercontent.com/" +
+                    repo_full_name + "/" + commit['sha'] + "/" + file_path)
+            except:
+                continue
+            insert_commit(commit, content_res, file_id)
+        # sam += 1
+        # total_sam += 1
+        clear_footer()
+        print_stratum(overwrite=True)
+        print_footer()
+        # if sam >= pop:
+        #     return
+    
 
 #-------------------------------------------------------------------------------
 
@@ -337,8 +392,11 @@ def insert_repo(repo):
         ))
     db.commit()
 
+# Here we insert a file into the results database. For further computations
+# we check the file_id after insertion and return it.
+
 def insert_file(file,repo_id):
-    db.execute('''
+    local_cur = db.execute('''
         INSERT OR IGNORE INTO file
             (name, path, sha, repo_id)
         VALUES (?,?,?,?)
@@ -348,31 +406,43 @@ def insert_file(file,repo_id):
         , file['sha']
         , repo_id
         ))
+    file_id = local_cur.lastrowid
     db.commit()
+    return file_id
 
-def insert_commit(commit,file_id):
+# It is important to parse the correct datatypes to the sqlite db. Hence we
+# convert the 'content-length' to an integer and the commit 'date' to a date-
+# time object.
+# Just a little reminder. Conversion of content if it would be base64 encoded:
+# base64.b64decode(file['content']).decode('UTF-8')
+
+def insert_commit(commit,content_res,file_id):
+    # TODO: size doesn't return the same value as GitHub Content API for the file
+    # TODO: Check how to store 'created' as timestamp and not as string
+    # time.strptime(commit['commit']['committer']['date'], "%Y-%m-%dT%H:%M:%SZ")
+    # --> type: time.struct_time
     db.execute('''
-        INSERT OR IGNORE INTO commit
+        INSERT OR IGNORE INTO comit
             (sha, message, size, created, content, file_id)
         VALUES (?,?,?,?,?,?)
         ''',
         ( commit['sha']
-        , commit['message']
-        , commit['size']
-        , commit['created'] # TODO must be format DATETIME!
-        , base64.b64decode(commit['content']).decode('UTF-8')
+        , commit['commit']['message']
+        , sys.getsizeof(content_res.text) # int(content_res.headers.get('content-length'))
+        , commit['commit']['committer']['date']
+        , content_res.text
         , file_id
         ))
     db.commit()
 
 def known_file(item):
-    cur = db.execute("select count(*) from file where path = ? and repo_id = ?", 
+    cur = db.execute("select count(*) from file where path = ? and repo_id = ?",
         (item['path'], item['repository']['id']))
     return cur.fetchone()[0] == 1
 
-def known_commit(item):
-    cur = db.execute("select count(*) from commit where sha = ? and file_id = ?", 
-        (item['sha'], item['file']['id']))
+def known_commit(item, file_id):
+    cur = db.execute("select count(*) from comit where sha = ? and file_id = ?",
+        (item['sha'], file_id))
     return cur.fetchone()[0] == 1    
 
 #-------------------------------------------------------------------------------
