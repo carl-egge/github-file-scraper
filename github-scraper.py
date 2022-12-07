@@ -122,10 +122,12 @@ est_pop = -1
 total_sam = -1
 
 # We also want to keep track of the execution time of the script, therefore we 
-# store the starting time. And just for information we count the total amount
-# of github api calls that have been made.
+# store the starting time. Additionally we store the ratelimit-used information
+# to keep track of how many api_calls can still use. And just for information 
+# we count the total amount of github api calls that have been made.
 
 start = time.time()
+rate_used = 0
 api_calls = 0
 
 #-------------------------------------------------------------------------------
@@ -177,10 +179,12 @@ def print_footer():
     print('%16s   %10s   %10s   %6s' % (size, pop_str, sam_str, per))
     print('                   (estimated)') if est_pop > -1 else print()
     print()
+    print('GitHub Ratelimit: %d / ~5000' % (rate_used))
+    print()
     print(status_msg)
 
 def clear_footer():
-    sys.stdout.write(f'\033[7F\r\033[J')
+    sys.stdout.write(f'\033[9F\r\033[J')
 
 # For convenience, we also have function for just updating the status message.
 # It returns the old message so it can be restored later if desired.
@@ -202,12 +206,13 @@ def update_status(msg):
 # automatically retrying the request.
 
 def get(url, params={}):
-    global api_calls
+    global api_calls, rate_used
     if args.throttle:
         time.sleep(0.72) # throttle requests to ~5000 per hour
     res = requests.get(url, params, headers=
         {'Authorization': f'token {args.github_token}'})
     api_calls += 1
+    rate_used = int(res.headers.get('X-RateLimit-Used'))
     if res.status_code == 403:
         return handle_rate_limit_error(res)
     else:
@@ -299,7 +304,6 @@ def download_all_commits(item, file_id):
         return
     download_commits_from_page(commits_res, item['repository']['full_name'],
                                 item['path'], file_id)
-    # TODO: Test this while loop with a search that returns more than 100 commits
     while 'next' in commits_res.links:
         update_status('Getting next page of commits...')
         commits_res = get(commits_res.links['next']['url'])
