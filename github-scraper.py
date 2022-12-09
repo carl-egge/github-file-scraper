@@ -109,17 +109,19 @@ strat_last = min(args.min_size + args.stratum_size - 1, args.max_size)
 # ...as well as the current stratum's population and the amount of files sampled
 # so far (in the current stratum). A value of -1 indicates "unknown".
 
-# TODO: Introduce global counter for sampled of commits
+# TODO: Optionally a global counter for the current sample of commits could
+# be introduced
 
 pop = -1
 sam = -1
 
 # We also have an estimate of the overall population (although it's gonna be
 # very unreliable), and we keep track of the total (cumulative) sample size so
-# far.
+# far, and we store the (cumulative) amount of downloaded commits.
 
 est_pop = -1
 total_sam = -1
+total_com = 0
 
 # We also want to keep track of the execution time of the script, therefore we 
 # store the starting time. Additionally we store the ratelimit-used information
@@ -179,12 +181,13 @@ def print_footer():
     print('%16s   %10s   %10s   %6s' % (size, pop_str, sam_str, per))
     print('                   (estimated)') if est_pop > -1 else print()
     print()
-    print('GitHub Ratelimit: %d / ~5000' % (rate_used))
+    print('Total of downloaded commits: ', str(total_com))
+    print('Current GitHub Ratelimit: %d / ~5000' % (rate_used))
     print()
     print(status_msg)
 
 def clear_footer():
-    sys.stdout.write(f'\033[9F\r\033[J')
+    sys.stdout.write(f'\033[10F\r\033[J')
 
 # For convenience, we also have function for just updating the status message.
 # It returns the old message so it can be restored later if desired.
@@ -277,15 +280,10 @@ def download_files_from_page(res):
             repo = item['repository']
             insert_repo(repo)
             file_id = insert_file(item, repo['id'])
-            download_all_commits(item, file_id)
-            # TODO: Later we remove this code here
-            # try:
-            #     url = item['url'].replace('#', '%23')
-            #     file = get(url).json()
-            # except:
-            #     continue
-            # if file['type'] == 'file':
-            #     insert_file(file, repo['id'])
+            try:
+                download_all_commits(item, file_id)
+            except:
+                continue
         sam += 1
         total_sam += 1
         clear_footer()
@@ -304,35 +302,31 @@ def download_all_commits(item, file_id):
         return
     download_commits_from_page(commits_res, item['repository']['full_name'],
                                 item['path'], file_id)
+    # If more than 100 commits exist we loop over the pages of commits
     while 'next' in commits_res.links:
         update_status('Getting next page of commits...')
         commits_res = get(commits_res.links['next']['url'])
         download_commits_from_page(commits_res, item['repository']['full_name'],
                                     item['path'], file_id)
-        # com_pop2 = commits_res.json()['total_count']
-        # com_pop = max(pop,pop2)
-        # if com_sam >= com_pop:    <- TODO: Why this?
-        #    break
     update_status('')
 
 def download_commits_from_page(commits_res, repo_full_name, file_path, file_id):
-    update_status('Downloading commits...')
+    count_commits = str(len(commits_res.json())) if len(commits_res.json()) < 100 else "100+"
+    update_status('Downloading ' + count_commits + ' commits...')
     for commit in commits_res.json():
-        if not known_commit(commit, file_id):
-            # Try to get the file content from the raw API (no rate limit)
-            try:
-                content_res = requests.get("https://raw.githubusercontent.com/" +
-                    repo_full_name + "/" + commit['sha'] + "/" + file_path)
-            except:
-                continue
-            insert_commit(commit, content_res, file_id)
-        # sam += 1
-        # total_sam += 1
-        clear_footer()
-        print_stratum(overwrite=True)
-        print_footer()
-        # if sam >= pop:
-        #     return
+        try:
+            if not known_commit(commit, file_id):
+                # Try to get the file content from the raw API (no rate limit)
+                try:
+                    content_res = requests.get("https://raw.githubusercontent.com/" +
+                        repo_full_name + "/" + commit['sha'] + "/" + file_path)
+                except:
+                    continue
+                insert_commit(commit, content_res, file_id)
+                global total_com
+                total_com += 1
+        except:
+            continue
     
 
 #-------------------------------------------------------------------------------
@@ -377,6 +371,9 @@ db.executescript('''
     );
     ''')
 
+# We also count the commits that have already been downloaded
+total_com = int(db.execute("SELECT COUNT() FROM comit").fetchone()[0])
+
 def insert_repo(repo):
     db.execute('''
         INSERT OR IGNORE INTO repo 
@@ -414,17 +411,13 @@ def insert_file(file,repo_id):
     db.commit()
     return file_id
 
-# It is important to parse the correct datatypes to the sqlite db. Hence we
-# convert the 'content-length' to an integer and the commit 'date' to a date-
-# time object.
-# Just a little reminder. Conversion of content if it would be base64 encoded:
-# base64.b64decode(file['content']).decode('UTF-8')
+# In order to get the byte size of the file content we check the length of the
+# content of the response object. The timestamp is stored as the string directly
+# from the API response, since sqlite can't store time objects anyway.
+# The parent field stores a list of git_shas that correspond to the parent commits.
 
 def insert_commit(commit,content_res,file_id):
-    # TODO: size doesn't return the same value as GitHub Content API for the file
-    # TODO: Check how to store 'created' as timestamp and not as string
-    # time.strptime(commit['commit']['committer']['date'], "%Y-%m-%dT%H:%M:%SZ")
-    # --> type: time.struct_time
+    # TODO Add parents to data model
     db.execute('''
         INSERT OR IGNORE INTO comit
             (sha, message, size, created, content, file_id)
@@ -432,7 +425,7 @@ def insert_commit(commit,content_res,file_id):
         ''',
         ( commit['sha']
         , commit['commit']['message']
-        , sys.getsizeof(content_res.text) # int(content_res.headers.get('content-length'))
+        , len(content_res.content)
         , commit['commit']['committer']['date']
         , content_res.text
         , file_id
@@ -509,7 +502,7 @@ def signal_handler(sig,frame):
     global start
     global api_calls
     print("The program took " + time.strftime("%H:%M:%S", time.gmtime((time.time())-start)) + " to execute (Hours:Minutes:Seconds).")
-    print("The program has requested " + str(api_calls) + " API calls from github.")
+    print("The program has requested " + str(api_calls) + " API calls from github.\n\n")
     sys.exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
@@ -571,4 +564,4 @@ while strat_first <= args.max_size:
 
 update_status('Done.')
 print("The program took " + time.strftime("%H:%M:%S", time.gmtime((time.time())-start)) + " to execute (Hours:Minutes:Seconds).")
-print("The program has requested " + str(api_calls) + " API calls from github.")
+print("The program has requested " + str(api_calls) + " API calls from github.\n\n")
