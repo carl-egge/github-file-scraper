@@ -322,7 +322,11 @@ def download_commits_from_page(commits_res, repo_full_name, file_path, file_id):
                         repo_full_name + "/" + commit['sha'] + "/" + file_path)
                 except:
                     continue
-                insert_commit(commit, content_res, file_id)
+                # Extract only shas of parents from api response
+                parents = []
+                for p in commit['parents']:
+                    parents.append(p['sha'])
+                insert_commit(commit, content_res, parents, file_id)
                 global total_com
                 total_com += 1
         except:
@@ -365,6 +369,7 @@ db.executescript('''
     , size INTEGER NOT NULL
     , created DATETIME DEFAULT CURRENT_TIMESTAMP
     , content TEXT NOT NULL
+    , parents TEXT NOT NULL
     , file_id INTEGER NOT NULL
     , FOREIGN KEY (file_id) REFERENCES file(file_id)
     , UNIQUE(sha,file_id)
@@ -416,18 +421,18 @@ def insert_file(file,repo_id):
 # from the API response, since sqlite can't store time objects anyway.
 # The parent field stores a list of git_shas that correspond to the parent commits.
 
-def insert_commit(commit,content_res,file_id):
-    # TODO Add parents to data model
+def insert_commit(commit,content_res,parents,file_id):
     db.execute('''
         INSERT OR IGNORE INTO comit
-            (sha, message, size, created, content, file_id)
-        VALUES (?,?,?,?,?,?)
+            (sha, message, size, created, content, parents, file_id)
+        VALUES (?,?,?,?,?,?,?)
         ''',
         ( commit['sha']
         , commit['commit']['message']
         , len(content_res.content)
         , commit['commit']['committer']['date']
         , content_res.text
+        , str(parents)
         , file_id
         ))
     db.commit()
@@ -440,7 +445,7 @@ def known_file(item):
 def known_commit(item, file_id):
     cur = db.execute("select count(*) from comit where sha = ? and file_id = ?",
         (item['sha'], file_id))
-    return cur.fetchone()[0] == 1    
+    return cur.fetchone()[0] == 1
 
 #-------------------------------------------------------------------------------
 
