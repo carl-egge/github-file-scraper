@@ -24,6 +24,8 @@
 
 ############################  GITHUB FILE SCRAPER  #############################
 
+############ VERSION: Repository Search
+
 # This script is a modification of the github-searcher from Michael Schröder and
 # Jürgen Cito. It exhaustively samples GitHub Code Search results and stores the 
 # files including their commit history and their content.
@@ -32,7 +34,7 @@
 # Its main purpose is to build a local database of Solidity smart contracts and
 # their versions.
 
-import os, sys, argparse, shutil, time, signal
+import os, sys, argparse, shutil, time, signal, re
 import base64, sqlite3, csv
 import requests
 
@@ -70,6 +72,9 @@ parser.add_argument('--stratum-size', metavar='BYTES', type=int, default=1,
 
 parser.add_argument('--no-throttle', dest='throttle', action='store_false', 
     help='disable request throttling')
+
+parser.add_argument('--open-license', dest='licensed', action='store_true', 
+    help='only search for code with open source licenses')
 
 parser.add_argument('--github-token', metavar='TOKEN', 
     default=os.environ.get('GITHUB_TOKEN'), 
@@ -119,7 +124,7 @@ sam = -1
 # very unreliable), and we keep track of the total (cumulative) sample size so
 # far, and we store the (cumulative) amount of downloaded commits.
 
-est_pop = -1
+# est_pop = -1
 total_sam = -1
 total_com = 0
 
@@ -131,6 +136,15 @@ total_com = 0
 start = time.time()
 rate_used = 0
 api_calls = 0
+
+# Store list of opensource liscense keys for GitHub API. This list only includes
+# copyleft licenses that have no condition or only the condition to include a
+# open source license again ('include-copyright') when redistributing the work.
+licenses = ['mit', 'unlicense', 'cc0-1.0', 'bsd-2-clause', 'bsd-3-clause']
+
+# The secondary rate limit blocks heavy requests when they come too quickly one
+# after the other. Therefore we store and check the last time we ran a search.
+last_search = 0
 
 #-------------------------------------------------------------------------------
 
@@ -172,14 +186,14 @@ def print_footer():
         size = '%d' % args.min_size
     else:
         size = '%d .. %d' % (args.min_size, args.max_size)
-    pop_str = str(est_pop) if est_pop > -1 else ''
+    # pop_str = str(est_pop) if est_pop > -1 else ''
     sam_str = str(total_sam) if total_sam > -1 else ''
-    per = '%6.2f%%' % (total_sam/est_pop*100) if est_pop > 0 else ''
+    # per = '%6.2f%%' % (total_sam/est_pop*100) if est_pop > 0 else ''
     print('                 ├────────────┼────────────┤')
     print('                 │ population │   sample   │')
     print('                 └────────────┴────────────┘')
-    print('%16s   %10s   %10s   %6s' % (size, pop_str, sam_str, per))
-    print('                   (estimated)') if est_pop > -1 else print()
+    print('%16s   %10s   %10s   %6s' % (size, '', sam_str, ''))
+    print() # print('                   (estimated)') if est_pop > -1 else print()
     print()
     print('Total of downloaded commits: ', str(total_com))
     print('Current GitHub Ratelimit: %d / ~5000' % (rate_used))
@@ -257,17 +271,93 @@ def handle_rate_limit_error(res):
 # stratum. Note that we sort the search results by how recently a file has been
 # indexed by GitHub.
 
-def search(a,b,order='asc'):
+def search_code(a,b,order='asc'):
+    last_search = time.time()
     return get('https://api.github.com/search/code',
                params={'q': f'{args.query} size:{a}..{b}', 
                 'sort': 'indexed', 'order': order, 'per_page': 100})
 
-# To download all files returned by a code search (up to the limit of 1000
-# imposed by GitHub), we need to deal with pagination. On each page, we loop 
-# through all files and add them and their metadata to our results database 
+def search_repos(a,b,order='asc',license="no"):
+    last_search = time.time()
+    if license == "no":
+        return get('https://api.github.com/search/repositories',
+               params={'q': f'{args.query} size:{a}..{b} fork:true', 
+                'sort': 'indexed', 'order': order, 'per_page': 100})                    
+    else:
+        return get('https://api.github.com/search/repositories',
+                params={'q': f'{args.query} license:{license} size:{a}..{b} fork:true', 
+                    'sort': 'indexed', 'order': order, 'per_page': 100})                
+
+#-------------------------------------------------------------------------------
+
+# To download all repos/files/commits returned by a code search (up to the limit 
+# of 1000 imposed by GitHub), we need to deal with pagination. On each page, we
+# loop through all items and add them and their metadata to our results database 
 # (which will be set up in the next section), provided they're not already in 
 # the database (which can happen when continuing a previous search). 
 # 
+# Also, if any of the repos or files or commits can not be downloaded, for whatever
+# reason, they are simply skipped over and count as not sampled.
+
+# DOWNLOAD REPOS
+# For each repository we request a list of files from the master branch and filter 
+# this list for required files.
+# TODO: Hardcoded: SOLIDITY, Make Query.Args depended).
+
+def download_all_repos(res):
+    download_repos_from_page(res)
+    while 'next' in res.links:
+        update_status('Getting next page of search results...')
+        global pop
+        res = get(res.links['next']['url'])
+        pop2 = res.json()['total_count']
+        pop = max(pop,pop2)
+        download_repos_from_page(res)
+        if sam >= pop:
+            break
+    update_status('')
+
+def download_repos_from_page(res):
+    global sam, total_sam
+    update_status('Get list of files in repository...')
+    for item in res.json()['items']:
+        try: 
+            if known_repo(item):
+                continue
+            else:
+                insert_repo(item)
+                try:
+                    # Request list of files in repository
+                    # Note: The limit for the tree array is 100,000 entries with a 
+                    # maximum size of 7 MB when using the recursive parameter.
+                    res = get("https://api.github.com/repos/" + item["full_name"] 
+                            + "/git/trees/" + item["default_branch"] + "?recursive=1")
+                except KeyboardInterrupt:
+                    signal_handler()
+                except:
+                    continue
+
+                update_status('Store files')
+                for node in res.json()['tree']:
+                    # TODO: HARDCODED check for solidity files
+                    if(node['type'] == "blob" and bool(re.search(r'\w\.sol', node['path']))):
+                        # Extract the file name from the path using regex
+                        name_re = re.search(r'[\w-]+?(?=\.)', node['path'])
+                        node['name'] = name_re.group(0) if name_re != None else node['path']
+                        # Store the file in the database
+                        file_id = insert_file(node, item['id'])
+                        download_all_commits(item, node, file_id)
+            sam += 1
+            total_sam += 1
+            clear_footer()
+            print_stratum(overwrite=True)
+            print_footer()
+            if sam >= pop:
+                return
+        except KeyboardInterrupt:
+            signal_handler()
+
+# DOWNLOAD COMMITS
 # For each of the files a list of commits is requested from the Github API.
 # The list of commits will again be paginated (with 100 elements per page).
 # Hence we loop over all pages and each of the commits on the pages. For a
@@ -275,56 +365,18 @@ def search(a,b,order='asc'):
 # has no rate limit. In the end the commits are also stored in the results
 # database, if they are not already in there.
 
-# Also, if any of the files or commits can not be downloaded, for whatever
-# reason, they are simply skipped over and count as not sampled.
-
-def download_all_files(res):
-    global pop
-    download_files_from_page(res)
-    while 'next' in res.links:
-        update_status('Getting next page of search results...')
-        res = get(res.links['next']['url'])
-        pop2 = res.json()['total_count']
-        pop = max(pop,pop2)
-        download_files_from_page(res)
-        if sam >= pop:
-            break
-    update_status('')
-
-def download_files_from_page(res):
-    global sam, total_sam
-    update_status('Downloading files...')
-    for item in res.json()['items']:
-        if not known_file(item):
-            repo = item['repository']
-            insert_repo(repo)
-            file_id = insert_file(item, repo['id'])
-            try:
-                download_all_commits(item, file_id)
-            except KeyboardInterrupt:
-                signal_handler()
-            else:
-                continue
-        sam += 1
-        total_sam += 1
-        clear_footer()
-        print_stratum(overwrite=True)
-        print_footer()
-        if sam >= pop:
-            return
-
-def download_all_commits(item, file_id):
+def download_all_commits(repo, file, file_id):
     # Get the list of commits for this file
-    commits_url = item['repository']['commits_url'][:-6].replace('#', '%23')
-    commits_res = get(commits_url, params={'path': item['path'], 'per_page': 100})
-    download_commits_from_page(commits_res, item['repository']['full_name'],
-                                item['path'], file_id)
+    commits_url = repo['commits_url'][:-6].replace('#', '%23')
+    commits_res = get(commits_url, params={'path': file['path'], 'per_page': 100})
+    download_commits_from_page(commits_res, repo['full_name'],
+                                file['path'], file_id)
     # If more than 100 commits exist we loop over the pages of commits
     while 'next' in commits_res.links:
         update_status('Getting next page of commits...')
         commits_res = get(commits_res.links['next']['url'])
-        download_commits_from_page(commits_res, item['repository']['full_name'],
-                                    item['path'], file_id)
+        download_commits_from_page(commits_res, repo['full_name'],
+                                    file['path'], file_id)
     update_status('')
 
 def download_commits_from_page(commits_res, repo_full_name, file_path, file_id):
@@ -338,6 +390,10 @@ def download_commits_from_page(commits_res, repo_full_name, file_path, file_id):
                     content_res = requests.get("https://raw.githubusercontent.com/" +
                         repo_full_name + "/" + commit['sha'] + "/" + file_path)
                 except:
+                    continue
+                # TODO: Put this check in master also:
+                # Don't store commits where no content was found
+                if content_res.text == "404: Not Found":
                     continue
                 # Extract only shas of parents from api response
                 parents = []
@@ -454,6 +510,11 @@ def insert_commit(commit,content_res,parents,file_id):
         ))
     db.commit()
 
+def known_repo(item):
+    cur = db.execute("select count(*) from repo where full_name = ? and repo_id = ?",
+        (item['full_name'], item['id']))
+    return cur.fetchone()[0] == 1
+
 def known_file(item):
     cur = db.execute("select count(*) from file where path = ? and repo_id = ?",
         (item['path'], item['repository']['id']))
@@ -468,14 +529,10 @@ def known_commit(item, file_id):
 
 # Now we can finally get into it! 
 
-# First, let's get an estimate of the total population.  Note that this is a
-# very, very unstable number that can not be relied upon!
-
-status_msg = 'Getting an estimate of the overall population...'
+# We do not get an estimation of the entire population in this version of the
+# script because it wouldn't make sense.
+status_msg = 'Initialize Program'
 print_footer()
-
-res = search(args.min_size, args.max_size)
-est_pop = int(res.json()['total_count'])
 total_sam = 0
 
 # Before starting the iterative search process, let's see if we have a sampling
@@ -543,39 +600,83 @@ while strat_first <= args.max_size:
     # We wait some time before calling the search query to avoid secondary rate limit.
     # (The secondary rate limit blocks heavy search request if they come within short
     # amount of time with a forbidden response.)
-    update_status('Buffering to avoid secondary rate limit error...')
-    time.sleep(60)
+    if time.time() - last_search < 60: 
+        update_status('Buffering to avoid secondary rate limit error...')
+        time.sleep(60)
 
-    update_status('Searching...')
-    res = search(strat_first, strat_last)
-    pop = int(res.json()['total_count'])
-    sam = 0
-    clear_footer()
-    print_stratum(overwrite=True)
-    print_footer()
+    # We check whether the search should filter for a license or not.
 
-    download_all_files(res)
-
-    # To stretch the 1000-results-per-query limit, we can simply repeat the
-    # search with the sort order reversed, thus sampling the stratum population
-    # from both ends, so to speak. This gives us a maximum sample size of 2000
-    # per stratum.
-
-    if pop > 1000:
-        update_status('Repeating search with reverse sort order...')
-        res = search(strat_first, strat_last, order='desc')
-        
-        # Due to the instability of search results, we might get a different
-        # population count on the second query. We will take the maximum of the
-        # two population counts for this stratum as a conservative estimate.
-
-        pop2 = int(res.json()['total_count'])
-        pop = max(pop,pop2)
+    if not args.licensed:
+        # non licensed search
+        update_status('Searching...')
+        res = search_repos(strat_first, strat_last)
+        pop = int(res.json()['total_count'])
+        sam = 0
         clear_footer()
         print_stratum(overwrite=True)
         print_footer()
 
-        download_all_files(res)
+        download_all_repos(res)
+
+        # To stretch the 1000-results-per-query limit, we can simply repeat the
+        # search with the sort order reversed, thus sampling the stratum population
+        # from both ends, so to speak. This gives us a maximum sample size of 2000
+        # per stratum.
+
+        if pop > 1000:
+            update_status('Repeating search with reverse sort order...')
+            res = search_repos(strat_first, strat_last, order='desc')
+            
+            # Due to the instability of search results, we might get a different
+            # population count on the second query. We will take the maximum of the
+            # two population counts for this stratum as a conservative estimate.
+
+            pop2 = int(res.json()['total_count'])
+            pop = max(pop,pop2)
+            clear_footer()
+            print_stratum(overwrite=True)
+            print_footer()
+
+            download_all_repos(res)
+
+
+    else:
+        # only licensed search
+        for lics in licenses:
+            update_status(f'Searching for {lics} licensed repositories...')
+            res = search_repos(strat_first, strat_last,license=lics)
+            pop = int(res.json()['total_count'])
+            sam = 0
+            clear_footer()
+            print_stratum(overwrite=True)
+            print_footer()
+
+            download_all_repos(res)
+
+            # To stretch the 1000-results-per-query limit, we can simply repeat the
+            # search with the sort order reversed, thus sampling the stratum population
+            # from both ends, so to speak. This gives us a maximum sample size of 2000
+            # per stratum.
+
+            if pop > 1000:
+                update_status('Repeating search with reverse sort order...')
+                res = search_repos(strat_first, strat_last, order='desc',license=lics)
+                
+                # Due to the instability of search results, we might get a different
+                # population count on the second query. We will take the maximum of the
+                # two population counts for this stratum as a conservative estimate.
+
+                pop2 = int(res.json()['total_count'])
+                pop = max(pop,pop2)
+                clear_footer()
+                print_stratum(overwrite=True)
+                print_footer()
+
+                download_all_repos(res)
+
+
+
+
 
     # After we've sampled as much as we could of the current strata, commit it
     # to the table and move on to the next one.
