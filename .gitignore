@@ -1,2 +1,5 @@
 *.db
 *.csv
+.env
+log.txt
+log/
