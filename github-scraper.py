@@ -219,6 +219,12 @@ def get(url, params={}):
     if res.status_code == 403:
         return handle_rate_limit_error(res)
     else:
+        # Write Request to Log
+        logger = open("log.txt", "a")
+        logging_str = ("\n\nTime: " + time.strftime("%m/%d/%Y, %H:%M:%S", time.localtime()) 
+            + "\nRequest: " + str(res.url) + "\nStatus: "+ str(res.status_code))
+        logger.write(logging_str)
+        logger.close()
         res.raise_for_status()
         return res
 
@@ -228,6 +234,19 @@ def handle_rate_limit_error(res):
         t = max(0, int(int(t) - time.time()))
     else: 
         t = int(res.headers.get('Retry-After', 60))
+    l = res.res.headers.get('X-RateLimit-Limit')
+    if (l is not None and l == 30):
+        # Secondary Rate Limit Error so we increase the buffing time
+        t += 60
+
+    # Write Error to Log file
+    logger = open("log.txt", "a")
+    logging_str = ("\n\nERROR :: Time: " + time.strftime("%m/%d/%Y, %H:%M:%S", time.localtime()) 
+            + "\nRequest: " + str(res.url) + "\nStatus: 403\nMessage: " + res.json()['message'])
+    logger.write(logging_str)
+    logger.close()
+
+    # Write Error to output
     err_msg = f'Exceeded rate limit. Retrying after {t} seconds...'
     old_msg = update_status(err_msg)
     time.sleep(t)
@@ -282,7 +301,9 @@ def download_files_from_page(res):
             file_id = insert_file(item, repo['id'])
             try:
                 download_all_commits(item, file_id)
-            except:
+            except KeyboardInterrupt:
+                signal_handler()
+            else:
                 continue
         sam += 1
         total_sam += 1
@@ -293,13 +314,9 @@ def download_files_from_page(res):
             return
 
 def download_all_commits(item, file_id):
-    # Try to get the list of commits for this file
-    try:
-        commits_url = item['repository']['commits_url'][:-6].replace('#', '%23')
-        commits_res = get(commits_url, params={'path': item['path'], 'per_page': 100})
-    except:
-        update_status('Could not get commit history.')
-        return
+    # Get the list of commits for this file
+    commits_url = item['repository']['commits_url'][:-6].replace('#', '%23')
+    commits_res = get(commits_url, params={'path': item['path'], 'per_page': 100})
     download_commits_from_page(commits_res, item['repository']['full_name'],
                                 item['path'], file_id)
     # If more than 100 commits exist we loop over the pages of commits
@@ -506,8 +523,9 @@ def signal_handler(sig,frame):
     statsfile.close()
     global start
     global api_calls
-    print("The program took " + time.strftime("%H:%M:%S", time.gmtime((time.time())-start)) + " to execute (Hours:Minutes:Seconds).")
-    print("The program has requested " + str(api_calls) + " API calls from github.\n\n")
+    print("\nThe program took " + time.strftime("%H:%M:%S", 
+        time.gmtime((time.time())-start)) + " to execute (Hours:Minutes:Seconds).")
+    print("The program has requested " + str(api_calls) + " API calls from github.\n")
     sys.exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
@@ -521,6 +539,13 @@ print_footer()
 # Iterating through all the strata, we want to sample as much as we can.
 
 while strat_first <= args.max_size:
+    
+    # We wait some time before calling the search query to avoid secondary rate limit.
+    # (The secondary rate limit blocks heavy search request if they come within short
+    # amount of time with a forbidden response.)
+    update_status('Buffering to avoid secondary rate limit error...')
+    time.sleep(60)
+
     update_status('Searching...')
     res = search(strat_first, strat_last)
     pop = int(res.json()['total_count'])
