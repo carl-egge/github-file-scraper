@@ -1,7 +1,8 @@
 #-------------------------------------------------------------------------------
 # MIT License
 #
-# Copyright (c) 2019 Michael Schröder, Jürgen Cito, Carl Egge, Stefan Schulte
+# Copyright (c) 2019 Michael Schröder, Jürgen Cito, Carl Egge, Stefan Schulte, 
+# Avik Banerjee
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -24,18 +25,19 @@
 
 ############################  GITHUB FILE SCRAPER  #############################
 
-############ VERSION: Repository Search
+######## VERSION: Search for User-specified language
+#    ----> Search Logic: GitHub Repository Search Endpoint
 
 # This script is a modification of the github-searcher from Michael Schröder and
-# Jürgen Cito. It exhaustively samples GitHub Code Search results and stores the 
-# files including their commit history and their content.
+# Jürgen Cito. It exhaustively samples GitHub Repo Search results and stores the 
+# files of a specified language including their commit history and their content.
 
 # This script was developed by Carl Egge on behalf of the Christian Doppler Labor.
 # Its main purpose is to build a local database of Solidity smart contracts and
-# their versions.
+# their versions. It is build in a semi-chronical readable fashion.
 
 import os, sys, argparse, shutil, time, signal, re
-import base64, sqlite3, csv
+import sqlite3, csv
 import requests
 
 # Before we get to the fun stuff, we need to parse and validate arguments, check
@@ -46,9 +48,18 @@ os.environ['COLUMNS'] = str(shutil.get_terminal_size().columns)
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawDescriptionHelpFormatter,
-    description='''Exhaustively sample the GitHub Code Search API.''')
+    description='''Exhaustively sample the GitHub Code Search API and 
+        store files and commits of a given programming language.''')
 
-parser.add_argument('query', metavar='QUERY', help='search query')
+parser.add_argument('-l', '--language', metavar='LANGUAGE',
+    default='Solidity',
+    help='''Please provide the name of the programming language that you
+        want to search for (default: Solidity)''')
+
+parser.add_argument('-e', '--extension', metavar='EXTENSION',
+    default='sol',
+    help='''Please provide the file extension corresponding to the programming
+        language that should be sampled without the dot (default: sol)''')
 
 parser.add_argument('--database', metavar='FILE', default='results.db', 
     help='search results database file (default: results.db)')
@@ -66,13 +77,17 @@ parser.add_argument('--max-size', metavar='BYTES', type=int,
     default=MAX_FILE_SIZE, 
     help=f'maximum code file size (default: {MAX_FILE_SIZE})')
 
-parser.add_argument('--stratum-size', metavar='BYTES', type=int, default=1,
+parser.add_argument('--stratum-size', metavar='BYTES', type=int, default=5,
     help='''length of file size ranges into which population is partitioned 
-    (default: 1)''')
+    (default: 5)''')
 
 parser.add_argument('--no-throttle', dest='throttle', action='store_false', 
     help='disable request throttling')
 
+parser.add_argument('--search-forks', dest='forks', action='store_true', 
+    help='''add 'fork:true' to query which includes forked repos in the result''')
+
+# TODO Rename to license-filter
 parser.add_argument('--open-license', dest='licensed', action='store_true', 
     help='only search for code with open source licenses')
 
@@ -141,6 +156,7 @@ api_calls = 0
 # copyleft licenses that have no condition or only the condition to include a
 # open source license again ('include-copyright') when redistributing the work.
 licenses = ['mit', 'unlicense', 'cc0-1.0', 'bsd-2-clause', 'bsd-3-clause']
+current_lics = ''
 
 # The secondary rate limit blocks heavy requests when they come too quickly one
 # after the other. Therefore we store and check the last time we ran a search.
@@ -194,7 +210,7 @@ def print_footer():
     print('                 └────────────┴────────────┘')
     print('%16s   %10s   %10s   %6s' % (size, '', sam_str, ''))
     print() # print('                   (estimated)') if est_pop > -1 else print()
-    print()
+    print('Current license: ', current_lics)
     print('Total of downloaded commits: ', str(total_com))
     print('Current GitHub Ratelimit: %d / ~5000' % (rate_used))
     print()
@@ -225,20 +241,20 @@ def update_status(msg):
 def get(url, params={}):
     global api_calls, rate_used
     if args.throttle:
-        time.sleep(0.72) # throttle requests to ~5000 per hour
-    res = requests.get(url, params, headers=
-        {'Authorization': f'token {args.github_token}'})
+        time.sleep(0.4) # throttle requests to ~5000 per hour: 0.72
+    try:
+        res = requests.get(url, params, headers=
+            {'Authorization': f'token {args.github_token}'})
+    except:
+        print("\nERROR :: There seems to be a problem with your internet connection.")
+        return signal_handler(0,0)
     api_calls += 1
-    rate_used = int(res.headers.get('X-RateLimit-Used'))
+    rate_used = (int(res.headers.get('X-RateLimit-Used')) if
+        res.headers.get('X-RateLimit-Used') != None else 0)
     if res.status_code == 403:
         return handle_rate_limit_error(res)
     else:
-        # Write Request to Log
-        logger = open("log.txt", "a")
-        logging_str = ("\n\nTime: " + time.strftime("%m/%d/%Y, %H:%M:%S", time.localtime()) 
-            + "\nRequest: " + str(res.url) + "\nStatus: "+ str(res.status_code))
-        logger.write(logging_str)
-        logger.close()
+        # TODO: Add logging of error message
         res.raise_for_status()
         return res
 
@@ -248,45 +264,60 @@ def handle_rate_limit_error(res):
         t = max(0, int(int(t) - time.time()))
     else: 
         t = int(res.headers.get('Retry-After', 60))
-    l = res.res.headers.get('X-RateLimit-Limit')
-    if (l is not None and l == 30):
-        # Secondary Rate Limit Error so we increase the buffing time
-        t += 60
+    
+    # TODO: Is this buffer needed?
+    # l = res.res.headers.get('X-RateLimit-Limit')
+    # if (l is not None and l == 30):
+    #     # Secondary Rate Limit Error so we increase the buffing time
+    #     t += 60
 
-    # Write Error to Log file
-    logger = open("log.txt", "a")
-    logging_str = ("\n\nERROR :: Time: " + time.strftime("%m/%d/%Y, %H:%M:%S", time.localtime()) 
-            + "\nRequest: " + str(res.url) + "\nStatus: 403\nMessage: " + res.json()['message'])
-    logger.write(logging_str)
-    logger.close()
-
-    # Write Error to output
     err_msg = f'Exceeded rate limit. Retrying after {t} seconds...'
     old_msg = update_status(err_msg)
     time.sleep(t)
     update_status(old_msg)
     return get(res.url)
 
+# In order to reduce the amount of GitHub API calls further we use the raw content API
+# from GitHub to request the content of the single commits. This also reduces the need
+# to throttle and hence makes the script theoretically faster. We define a function that
+# helps to request data from the 'raw.githubusercontent.com/' API.
+
+def get_content(url):
+    try:
+        res = requests.get(url)
+    except:
+        print("\nERROR :: There seems to be a problem with your internet connection.")
+        return signal_handler(0,0)
+    res.raise_for_status()
+    return res
+
+# This little helper function can be used to write information on the Response from any
+# request that has been executed into a log-file (default: log.txt).
+
+def handle_log_response(res,file="log.txt"):
+    logger = open(file, "a")
+    logging_str =  "\n\nTime: " + time.strftime("%m/%d/%Y, %H:%M:%S", time.localtime()) 
+    logging_str += "\nRequest: " + str(res.url) + "\nStatus: "+ str(res.status_code)
+    logging_str += "\nMessage: " + res.json()['message'] if res.json()['message'] else ''
+    logger.write(logging_str)
+    logger.close()
+
 # We also define a convenient function to do the code search for a specific
 # stratum. Note that we sort the search results by how recently a file has been
-# indexed by GitHub.
+# updated (sort can be one of: stars, forks, help-wanted-issues, updated).
+# We append search criteria 'fork' and 'license' depending on the user input 
+# to refine the search results.
 
-def search_code(a,b,order='asc'):
+def search(a,b,order='asc',license="no"):
+    global last_search
     last_search = time.time()
-    return get('https://api.github.com/search/code',
-               params={'q': f'{args.query} size:{a}..{b}', 
-                'sort': 'indexed', 'order': order, 'per_page': 100})
 
-def search_repos(a,b,order='asc',license="no"):
-    last_search = time.time()
-    if license == "no":
-        return get('https://api.github.com/search/repositories',
-               params={'q': f'{args.query} size:{a}..{b} fork:true', 
-                'sort': 'indexed', 'order': order, 'per_page': 100})                    
-    else:
-        return get('https://api.github.com/search/repositories',
-                params={'q': f'{args.query} license:{license} size:{a}..{b} fork:true', 
-                    'sort': 'indexed', 'order': order, 'per_page': 100})                
+    q_fork = 'true' if args.forks else 'false'
+    q_license = f'license:{license}' if license != "no" else ''
+    query = f'language:{args.language} size:{a}..{b} fork:{q_fork} {q_license}'
+    
+    return get('https://api.github.com/search/repositories',
+        params={'q': query, 'sort': 'updated', 'order': order, 'per_page': 100})
 
 #-------------------------------------------------------------------------------
 
@@ -302,7 +333,6 @@ def search_repos(a,b,order='asc',license="no"):
 # DOWNLOAD REPOS
 # For each repository we request a list of files from the master branch and filter 
 # this list for required files.
-# TODO: Hardcoded: SOLIDITY, Make Query.Args depended).
 
 def download_all_repos(res):
     download_repos_from_page(res)
@@ -321,6 +351,7 @@ def download_repos_from_page(res):
     global sam, total_sam
     update_status('Get list of files in repository...')
     for item in res.json()['items']:
+        # TODO: Remove this try and fix function and signal handler
         try: 
             if known_repo(item):
                 continue
@@ -336,17 +367,19 @@ def download_repos_from_page(res):
                     signal_handler()
                 except:
                     continue
+                if res.status_code != 200:
+                    continue
 
                 update_status('Store files')
                 for node in res.json()['tree']:
-                    # TODO: HARDCODED check for solidity files
-                    if(node['type'] == "blob" and bool(re.search(r'\w\.sol', node['path']))):
+                    if(node['type'] == "blob" and bool(re.search(fr'\w\.{args.extension}$', node['path']))):
                         # Extract the file name from the path using regex
                         name_re = re.search(r'[\w-]+?(?=\.)', node['path'])
                         node['name'] = name_re.group(0) if name_re != None else node['path']
-                        # Store the file in the database
-                        file_id = insert_file(node, item['id'])
-                        download_all_commits(item, node, file_id)
+                        if not known_file(node, item['id']):    
+                            # Store the file in the database
+                            file_id = insert_file(node, item['id'])
+                            download_all_commits(item, node, file_id)
             sam += 1
             total_sam += 1
             clear_footer()
@@ -369,6 +402,8 @@ def download_all_commits(repo, file, file_id):
     # Get the list of commits for this file
     commits_url = repo['commits_url'][:-6].replace('#', '%23')
     commits_res = get(commits_url, params={'path': file['path'], 'per_page': 100})
+    if commits_res.status_code != 200:
+        return 
     download_commits_from_page(commits_res, repo['full_name'],
                                 file['path'], file_id)
     # If more than 100 commits exist we loop over the pages of commits
@@ -383,27 +418,20 @@ def download_commits_from_page(commits_res, repo_full_name, file_path, file_id):
     count_commits = str(len(commits_res.json())) if len(commits_res.json()) < 100 else "100+"
     update_status('Downloading ' + count_commits + ' commits...')
     for commit in commits_res.json():
-        try:
-            if not known_commit(commit, file_id):
-                # Try to get the file content from the raw API (no rate limit)
-                try:
-                    content_res = requests.get("https://raw.githubusercontent.com/" +
-                        repo_full_name + "/" + commit['sha'] + "/" + file_path)
-                except:
-                    continue
-                # TODO: Put this check in master also:
-                # Don't store commits where no content was found
-                if content_res.text == "404: Not Found":
-                    continue
-                # Extract only shas of parents from api response
-                parents = []
-                for p in commit['parents']:
-                    parents.append(p['sha'])
-                insert_commit(commit, content_res, parents, file_id)
-                global total_com
-                total_com += 1
-        except:
-            continue
+        if not known_commit(commit, file_id):
+            try:
+                content_res = get_content("https://raw.githubusercontent.com/" +
+                    repo_full_name + "/" + commit['sha'] + "/" + file_path)
+            except:
+                continue
+
+            # Extract only shas of parents from api response
+            parents = []
+            for p in commit['parents']:
+                parents.append(p['sha'])
+            insert_commit(commit, content_res, parents, file_id)
+            global total_com
+            total_com += 1
     
 
 #-------------------------------------------------------------------------------
@@ -411,8 +439,8 @@ def download_commits_from_page(commits_res, repo_full_name, file_path, file_id):
 # This is a good place to open the connection to the results database, or create
 # one if it doesn't exist yet. The database schema follows the GitHub API
 # response schema. Our 'insert_repo', 'insert_file' and 'insert_comit' functions
-# directly take a JSON response dictionary. 'commit' is a reserved keyword in 
-# sqlite, therefore the tablename is 'comit'.
+# help to store the items in the database respectively. 'commit' is a reserved 
+# keyword in sqlite, therefore the tablename is 'comit'.
 
 db = sqlite3.connect(args.database)
 db.executescript('''
@@ -515,9 +543,9 @@ def known_repo(item):
         (item['full_name'], item['id']))
     return cur.fetchone()[0] == 1
 
-def known_file(item):
+def known_file(item, repo_id):
     cur = db.execute("select count(*) from file where path = ? and repo_id = ?",
-        (item['path'], item['repository']['id']))
+        (item['path'], repo_id))
     return cur.fetchone()[0] == 1
 
 def known_commit(item, file_id):
@@ -609,7 +637,7 @@ while strat_first <= args.max_size:
     if not args.licensed:
         # non licensed search
         update_status('Searching...')
-        res = search_repos(strat_first, strat_last)
+        res = search(strat_first, strat_last)
         pop = int(res.json()['total_count'])
         sam = 0
         clear_footer()
@@ -625,7 +653,7 @@ while strat_first <= args.max_size:
 
         if pop > 1000:
             update_status('Repeating search with reverse sort order...')
-            res = search_repos(strat_first, strat_last, order='desc')
+            res = search(strat_first, strat_last, order='desc')
             
             # Due to the instability of search results, we might get a different
             # population count on the second query. We will take the maximum of the
@@ -644,7 +672,8 @@ while strat_first <= args.max_size:
         # only licensed search
         for lics in licenses:
             update_status(f'Searching for {lics} licensed repositories...')
-            res = search_repos(strat_first, strat_last,license=lics)
+            current_lics = lics
+            res = search(strat_first, strat_last,license=lics)
             pop = int(res.json()['total_count'])
             sam = 0
             clear_footer()
@@ -660,7 +689,7 @@ while strat_first <= args.max_size:
 
             if pop > 1000:
                 update_status('Repeating search with reverse sort order...')
-                res = search_repos(strat_first, strat_last, order='desc',license=lics)
+                res = search(strat_first, strat_last, order='desc',license=lics)
                 
                 # Due to the instability of search results, we might get a different
                 # population count on the second query. We will take the maximum of the
