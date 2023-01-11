@@ -126,22 +126,21 @@ if not args.github_token:
 strat_first = args.min_size
 strat_last = min(args.min_size + args.stratum_size - 1, args.max_size)
 
-# ...as well as the current stratum's population and the amount of files sampled
-# so far (in the current stratum). A value of -1 indicates "unknown".
+# ...as well as the current stratum's population of repositories and the amount
+# of repositories/files/commits that have been sampled so far (in the current 
+# stratum). A value of -1 indicates "unknown".
 
-# TODO: Optionally a global counter for the current sample of commits could
-# be introduced
+pop_repo = -1
+sam_repo = -1
+sam_file = -1
+sam_comit = -1
 
-pop = -1
-sam = -1
+# We also keep track of the total (cumulative) sample sizes so far, and we store 
+# it for the downloaded repos/files/commits respectivley.
 
-# We also have an estimate of the overall population (although it's gonna be
-# very unreliable), and we keep track of the total (cumulative) sample size so
-# far, and we store the (cumulative) amount of downloaded commits.
-
-# est_pop = -1
-total_sam = -1
-total_com = 0
+total_sam_repo = -1
+total_sam_file = -1
+total_sam_comit = -1
 
 # We also want to keep track of the execution time of the script, therefore we 
 # store the starting time. Additionally we store the ratelimit-used information
@@ -186,9 +185,9 @@ def print_stratum(overwrite=False):
         size = '%d' % strat_first
     else:
         size = '%d .. %d' % (strat_first, strat_last)
-    pop_str = str(pop) if pop > -1 else ''
-    sam_str = str(sam) if sam > -1 else ''
-    per = '%6.2f%%' % (sam/pop*100) if pop > 0 else ''
+    pop_str = str(pop_repo) if pop_repo > -1 else ''
+    sam_str = str(sam_repo) if sam_repo > -1 else ''
+    per = '%6.2f%%' % (sam_repo/pop_repo*100) if pop_repo > 0 else ''
     print('%16s │ %10s │ %10s │ %6s' % (size, pop_str, sam_str, per))
 
 # Another function will print the footer of the table, including summary
@@ -202,16 +201,14 @@ def print_footer():
         size = '%d' % args.min_size
     else:
         size = '%d .. %d' % (args.min_size, args.max_size)
-    # pop_str = str(est_pop) if est_pop > -1 else ''
-    sam_str = str(total_sam) if total_sam > -1 else ''
-    # per = '%6.2f%%' % (total_sam/est_pop*100) if est_pop > 0 else ''
+    sam_str = str(total_sam_repo) if total_sam_repo > -1 else ''
     print('                 ├────────────┼────────────┤')
     print('                 │ population │   sample   │')
     print('                 └────────────┴────────────┘')
     print('%16s   %10s   %10s   %6s' % (size, '', sam_str, ''))
-    print() # print('                   (estimated)') if est_pop > -1 else print()
-    print('Current license: ', current_lics)
-    print('Total of downloaded commits: ', str(total_com))
+    print()
+    print('Current license: ', current_lics) if args.licensed else print()
+    print('Total of downloaded commits: ', str(total_com)) # TODO: Remove this to other columns
     print('Current GitHub Ratelimit: %d / ~5000' % (rate_used))
     print()
     print(status_msg)
@@ -245,7 +242,7 @@ def get(url, params={}):
     try:
         res = requests.get(url, params, headers=
             {'Authorization': f'token {args.github_token}'})
-    except:
+    except requests.ConnectionError:
         print("\nERROR :: There seems to be a problem with your internet connection.")
         return signal_handler(0,0)
     api_calls += 1
@@ -285,7 +282,7 @@ def handle_rate_limit_error(res):
 def get_content(url):
     try:
         res = requests.get(url)
-    except:
+    except requests.ConnectionError:
         print("\nERROR :: There seems to be a problem with your internet connection.")
         return signal_handler(0,0)
     res.raise_for_status()
@@ -332,63 +329,54 @@ def search(a,b,order='asc',license="no"):
 
 # DOWNLOAD REPOS
 # For each repository we request a list of files from the master branch and filter 
-# this list for required files.
+# this list for required files of the specified programming language.
 
 def download_all_repos(res):
     download_repos_from_page(res)
     while 'next' in res.links:
         update_status('Getting next page of search results...')
-        global pop
+        global pop_repo
         res = get(res.links['next']['url'])
         pop2 = res.json()['total_count']
-        pop = max(pop,pop2)
+        pop_repo = max(pop_repo,pop2)
         download_repos_from_page(res)
-        if sam >= pop:
+        if sam_repo >= pop_repo:
             break
     update_status('')
 
-def download_repos_from_page(res):
-    global sam, total_sam
-    update_status('Get list of files in repository...')
-    for item in res.json()['items']:
-        # TODO: Remove this try and fix function and signal handler
-        try: 
-            if known_repo(item):
-                continue
-            else:
-                insert_repo(item)
-                try:
-                    # Request list of files in repository
-                    # Note: The limit for the tree array is 100,000 entries with a 
-                    # maximum size of 7 MB when using the recursive parameter.
-                    res = get("https://api.github.com/repos/" + item["full_name"] 
-                            + "/git/trees/" + item["default_branch"] + "?recursive=1")
-                except KeyboardInterrupt:
-                    signal_handler()
-                except:
-                    continue
-                if res.status_code != 200:
-                    continue
+# For each repo on one page we request list of files in repository and filter the files
+# depending on their file extension.
+# API: https://api.github.com/repos/<owner>/<repo>/git/trees/<master>?recursive=1
+# Note: The limit for the tree array is 100,000 entries with a maximum size of 7 MB 
+# when using the recursive parameter.
 
-                update_status('Store files')
-                for node in res.json()['tree']:
-                    if(node['type'] == "blob" and bool(re.search(fr'\w\.{args.extension}$', node['path']))):
-                        # Extract the file name from the path using regex
-                        name_re = re.search(r'[\w-]+?(?=\.)', node['path'])
-                        node['name'] = name_re.group(0) if name_re != None else node['path']
-                        if not known_file(node, item['id']):    
-                            # Store the file in the database
-                            file_id = insert_file(node, item['id'])
-                            download_all_commits(item, node, file_id)
-            sam += 1
-            total_sam += 1
-            clear_footer()
-            print_stratum(overwrite=True)
-            print_footer()
-            if sam >= pop:
-                return
-        except KeyboardInterrupt:
-            signal_handler()
+def download_repos_from_page(res):
+    global sam_repo, total_sam_repo
+    update_status('Get list of files in repository...')
+    for repo in res.json()['items']:
+        if not known_repo(repo):
+            insert_repo(repo)
+            try:
+                res = get("https://api.github.com/repos/" + repo["full_name"] 
+                        + "/git/trees/" + repo["default_branch"] + "?recursive=1")
+            except:
+                continue
+            
+            for file in res.json()['tree']:
+                if(file['type'] == "blob" and bool(re.search(fr'\w\.{args.extension}$', file['path']))):
+                    # Extract the file name from the path using regex
+                    name_re = re.search(r'[\w-]+?(?=\.)', file['path'])
+                    file['name'] = name_re.group(0) if name_re != None else file['path']
+                    if not known_file(file, repo['id']):
+                        file_id = insert_file(file, repo['id'])
+                        download_all_commits(repo, file, file_id)
+        sam_repo += 1
+        total_sam_repo += 1
+        clear_footer()
+        print_stratum(overwrite=True)
+        print_footer()
+        if sam_repo >= pop_repo:
+            return
 
 # DOWNLOAD COMMITS
 # For each of the files a list of commits is requested from the Github API.
@@ -399,14 +387,14 @@ def download_repos_from_page(res):
 # database, if they are not already in there.
 
 def download_all_commits(repo, file, file_id):
-    # Get the list of commits for this file
-    commits_url = repo['commits_url'][:-6].replace('#', '%23')
-    commits_res = get(commits_url, params={'path': file['path'], 'per_page': 100})
-    if commits_res.status_code != 200:
-        return 
+    try:
+        # Get the list of commits for this file
+        commits_url = repo['commits_url'][:-6].replace('#', '%23')
+        commits_res = get(commits_url, params={'path': file['path'], 'per_page': 100})
+    except:
+        return
     download_commits_from_page(commits_res, repo['full_name'],
                                 file['path'], file_id)
-    # If more than 100 commits exist we loop over the pages of commits
     while 'next' in commits_res.links:
         update_status('Getting next page of commits...')
         commits_res = get(commits_res.links['next']['url'])
@@ -430,8 +418,8 @@ def download_commits_from_page(commits_res, repo_full_name, file_path, file_id):
             for p in commit['parents']:
                 parents.append(p['sha'])
             insert_commit(commit, content_res, parents, file_id)
-            global total_com
-            total_com += 1
+            global total_sam_comit
+            total_sam_comit += 1
     
 
 #-------------------------------------------------------------------------------
@@ -477,44 +465,55 @@ db.executescript('''
     );
     ''')
 
-# We also count the commits that have already been downloaded
+# We also count the commits that have already been downloaded TODO: Remove here?
 total_com = int(db.execute("SELECT COUNT() FROM comit").fetchone()[0])
 
+# We run the sqlite3 queries in a try...except block to catch any database exceptions.
+# If we catch the DB Error: 'Cannot operate on a closed database.' this usually means
+# that the program was interrupted with ctrl-c. We don't want to print the error traceback
+# in this case therefore we just wait for the signal_handler to come to an end and then exit.
+
 def insert_repo(repo):
-    db.execute('''
-        INSERT OR IGNORE INTO repo 
-            ( repo_id, name, full_name, description, url, fork
-            , owner_id, owner_login
-            )
-        VALUES (?,?,?,?,?,?,?,?)
-        ''',
-        ( repo['id']
-        , repo['name']
-        , repo['full_name']
-        , repo['description']
-        , repo['url']
-        , int(repo['fork'])
-        , repo['owner']['id']
-        , repo['owner']['login']
-        ))
-    db.commit()
+    try:
+        db.execute('''
+            INSERT OR IGNORE INTO repo 
+                ( repo_id, name, full_name, description, url, fork
+                , owner_id, owner_login
+                )
+            VALUES (?,?,?,?,?,?,?,?)
+            ''',
+            ( repo['id']
+            , repo['name']
+            , repo['full_name']
+            , repo['description']
+            , repo['url']
+            , int(repo['fork'])
+            , repo['owner']['id']
+            , repo['owner']['login']
+            ))
+        db.commit()
+    except sqlite3.ProgrammingError as error:
+        return handle_db_error(error, 'insert_repo')
 
 # Here we insert a file into the results database. For further computations
 # we check the file_id after insertion and return it.
 
 def insert_file(file,repo_id):
-    local_cur = db.execute('''
-        INSERT OR IGNORE INTO file
-            (name, path, sha, repo_id)
-        VALUES (?,?,?,?)
-        ''',
-        ( file['name']
-        , file['path']
-        , file['sha']
-        , repo_id
-        ))
-    file_id = local_cur.lastrowid
-    db.commit()
+    try:
+        local_cur = db.execute('''
+            INSERT OR IGNORE INTO file
+                (name, path, sha, repo_id)
+            VALUES (?,?,?,?)
+            ''',
+            ( file['name']
+            , file['path']
+            , file['sha']
+            , repo_id
+            ))
+        file_id = local_cur.lastrowid
+        db.commit()
+    except sqlite3.ProgrammingError as error:
+        return handle_db_error(error, 'insert_file')
     return file_id
 
 # In order to get the byte size of the file content we check the length of the
@@ -523,35 +522,59 @@ def insert_file(file,repo_id):
 # The parent field stores a list of git_shas that correspond to the parent commits.
 
 def insert_commit(commit,content_res,parents,file_id):
-    db.execute('''
-        INSERT OR IGNORE INTO comit
-            (sha, message, size, created, content, parents, file_id)
-        VALUES (?,?,?,?,?,?,?)
-        ''',
-        ( commit['sha']
-        , commit['commit']['message']
-        , len(content_res.content)
-        , commit['commit']['committer']['date']
-        , content_res.text
-        , str(parents)
-        , file_id
-        ))
-    db.commit()
+    try:
+        db.execute('''
+            INSERT OR IGNORE INTO comit
+                (sha, message, size, created, content, parents, file_id)
+            VALUES (?,?,?,?,?,?,?)
+            ''',
+            ( commit['sha']
+            , commit['commit']['message']
+            , len(content_res.content)
+            , commit['commit']['committer']['date']
+            , content_res.text
+            , str(parents)
+            , file_id
+            ))
+        db.commit()
+    except sqlite3.ProgrammingError as error:
+        return handle_db_error(error, 'insert_commit')
 
 def known_repo(item):
-    cur = db.execute("select count(*) from repo where full_name = ? and repo_id = ?",
-        (item['full_name'], item['id']))
+    try:
+        cur = db.execute("select count(*) from repo where full_name = ? and repo_id = ?",
+            (item['full_name'], item['id']))
+    except sqlite3.ProgrammingError as error:
+        return handle_db_error(error, 'known_repo')
     return cur.fetchone()[0] == 1
 
 def known_file(item, repo_id):
-    cur = db.execute("select count(*) from file where path = ? and repo_id = ?",
-        (item['path'], repo_id))
+    try:
+        cur = db.execute("select count(*) from file where path = ? and repo_id = ?",
+            (item['path'], repo_id))
+    except sqlite3.ProgrammingError as error:
+        return handle_db_error(error, 'known_file')
     return cur.fetchone()[0] == 1
+    
 
 def known_commit(item, file_id):
-    cur = db.execute("select count(*) from comit where sha = ? and file_id = ?",
-        (item['sha'], file_id))
+    try:
+        cur = db.execute("select count(*) from comit where sha = ? and file_id = ?",
+            (item['sha'], file_id))
+    except sqlite3.ProgrammingError as error:
+        return handle_db_error(error, 'known_commit')
     return cur.fetchone()[0] == 1
+
+# Here we have a helper function to handle the potential DB Errors.
+
+def handle_db_error(error, origin):
+    if str(error.args) == "('Cannot operate on a closed database.',)":
+        return sys.exit(0)
+    else:
+        print(f'{origin}: DB Exception is {error.args}')
+        db.commit()
+        db.close()
+        return sys.exit(0)
 
 #-------------------------------------------------------------------------------
 
@@ -561,7 +584,9 @@ def known_commit(item, file_id):
 # script because it wouldn't make sense.
 status_msg = 'Initialize Program'
 print_footer()
-total_sam = 0
+total_sam_repo = 0
+total_sam_file = 0
+total_sam_comit = 0
 
 # Before starting the iterative search process, let's see if we have a sampling
 # statistics file that we could use to continue a previous search. If so, let's
@@ -576,17 +601,19 @@ if os.path.isfile(args.statistics):
         for row in fr:
             strat_first = int(row[0])
             strat_last = int(row[1])
-            pop = int(row[2])
-            sam = int(row[3])
-            total_sam += sam
+            pop_repo = int(row[2])
+            sam_repo = int(row[3])
+            total_sam_repo += sam_repo
+            total_sam_file += sam_file
+            total_sam_comit += sam_comit
             clear_footer()
             print_stratum()
             print_footer()
-        if pop > -1:
+        if pop_repo > -1:
             strat_first += args.stratum_size
             strat_last = min(strat_last + args.stratum_size, args.max_size)
-            pop = -1
-            sam = -1
+            pop_repo = -1
+            sam_repo = -1
 else:
     with open(args.statistics, 'w') as f:
         f.write('stratum_first,stratum_last,population,sample\n')
@@ -610,7 +637,7 @@ def signal_handler(sig,frame):
     global api_calls
     print("\nThe program took " + time.strftime("%H:%M:%S", 
         time.gmtime((time.time())-start)) + " to execute (Hours:Minutes:Seconds).")
-    print("The program has requested " + str(api_calls) + " API calls from github.\n")
+    print("The program has requested " + str(api_calls) + " API calls from github.")
     sys.exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
@@ -638,8 +665,10 @@ while strat_first <= args.max_size:
         # non licensed search
         update_status('Searching...')
         res = search(strat_first, strat_last)
-        pop = int(res.json()['total_count'])
-        sam = 0
+        pop_repo = int(res.json()['total_count'])
+        sam_repo = 0
+        sam_file = 0
+        sam_comit = 0
         clear_footer()
         print_stratum(overwrite=True)
         print_footer()
@@ -651,7 +680,7 @@ while strat_first <= args.max_size:
         # from both ends, so to speak. This gives us a maximum sample size of 2000
         # per stratum.
 
-        if pop > 1000:
+        if pop_repo > 1000:
             update_status('Repeating search with reverse sort order...')
             res = search(strat_first, strat_last, order='desc')
             
@@ -660,7 +689,7 @@ while strat_first <= args.max_size:
             # two population counts for this stratum as a conservative estimate.
 
             pop2 = int(res.json()['total_count'])
-            pop = max(pop,pop2)
+            pop_repo = max(pop_repo,pop2)
             clear_footer()
             print_stratum(overwrite=True)
             print_footer()
@@ -674,8 +703,10 @@ while strat_first <= args.max_size:
             update_status(f'Searching for {lics} licensed repositories...')
             current_lics = lics
             res = search(strat_first, strat_last,license=lics)
-            pop = int(res.json()['total_count'])
-            sam = 0
+            pop_repo = int(res.json()['total_count'])
+            sam_repo = 0
+            sam_file = 0
+            sam_comit = 0
             clear_footer()
             print_stratum(overwrite=True)
             print_footer()
@@ -687,7 +718,7 @@ while strat_first <= args.max_size:
             # from both ends, so to speak. This gives us a maximum sample size of 2000
             # per stratum.
 
-            if pop > 1000:
+            if pop_repo > 1000:
                 update_status('Repeating search with reverse sort order...')
                 res = search(strat_first, strat_last, order='desc',license=lics)
                 
@@ -696,7 +727,7 @@ while strat_first <= args.max_size:
                 # two population counts for this stratum as a conservative estimate.
 
                 pop2 = int(res.json()['total_count'])
-                pop = max(pop,pop2)
+                pop_repo = max(pop_repo,pop2)
                 clear_footer()
                 print_stratum(overwrite=True)
                 print_footer()
@@ -706,17 +737,16 @@ while strat_first <= args.max_size:
 
 
 
-
     # After we've sampled as much as we could of the current strata, commit it
     # to the table and move on to the next one.
 
-    stats.writerow([strat_first,strat_last,pop,sam])
+    stats.writerow([strat_first,strat_last,pop_repo,sam_repo])
     statsfile.flush()
     
     strat_first += args.stratum_size
     strat_last = min(strat_last + args.stratum_size, args.max_size)
-    pop = -1
-    sam = -1
+    pop_repo = -1
+    sam_repo = -1
 
     clear_footer()
     print_stratum()
