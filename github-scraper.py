@@ -143,18 +143,20 @@ total_sam_comit = -1
 
 # We also want to keep track of the execution time of the script, therefore we 
 # store the starting time. Additionally we store the ratelimit-used information
-# to keep track of how many api_calls can still use. And just for information 
+# to keep track of how many api_calls we can still use. And just for information 
 # we count the total amount of github api calls that have been made.
 
 start = time.time()
 rate_used = 0
 api_calls = 0
 
-# Store list of opensource liscense keys for GitHub API. This list only includes
-# copyleft licenses that have no condition or only the condition to include a
-# open source license again ('include-copyright') when redistributing the work.
+# Here we store list of opensource liscense keys for GitHub API. This list only
+# includes copyleft licenses that have no condition or only the condition to 
+# include a open source license again ('include-copyright') when redistributing
+# the work.
+
 licenses = ['mit', 'unlicense', 'cc0-1.0', 'bsd-2-clause', 'bsd-3-clause']
-current_lics = ''
+current_license = ''
 current_cumulative_pop = 0
 
 #-------------------------------------------------------------------------------
@@ -209,7 +211,7 @@ def print_footer():
     print('%16s   %10s   %10s   %10s   %10s   %6s' % (size, '', tot_sam_repo_str,
         tot_sam_file_str, tot_sam_comit_str, ''))
     print()
-    print('Current queried license: ', current_lics) if args.licensed else print()
+    print('Current queried license: ', current_license) if args.licensed else print()
     print('Current GitHub ratelimit: %d / ~5000' % (rate_used))
     print()
     print(status_msg)
@@ -285,8 +287,8 @@ def get_content(url):
     res.raise_for_status()
     return res
 
-# This little helper function can be used to write information on the Response from any
-# request that has been executed into a log-file (default: log.txt).
+# This helper function can be used to write information on the Response from a request 
+# into a log-file (default: log.txt).
 
 def handle_log_response(res,file="log.txt"):
     err_msg = f'Request response error with status: {res.status_code} (for details see {file})'
@@ -317,17 +319,22 @@ def search(a,b,order='asc',license="no"):
 #-------------------------------------------------------------------------------
 
 # To download all repos/files/commits returned by a code search (up to the limit 
-# of 1000 imposed by GitHub), we need to deal with pagination. On each page, we
-# loop through all items and add them and their metadata to our results database 
-# (which will be set up in the next section), provided they're not already in 
-# the database (which can happen when continuing a previous search). 
-# 
+# of 1000 repo search results imposed by GitHub), we need to deal with pagination.
+# On each page, we loop through all items and add them and their metadata to our
+# results database (which will be set up in the next section), provided they're 
+# not already in the database (which can happen when continuing a previous search).
+# We filter the files in each repository and store only the desired one. We then
+# get the entire history of commits for each file, loop through all items using
+# pagination and store the commits in the results database.
 # Also, if any of the repos or files or commits can not be downloaded, for whatever
 # reason, they are simply skipped over and count as not sampled.
 
 # DOWNLOAD REPOS
 # For each repository we request a list of files from the master branch and filter 
-# this list for required files of the specified programming language.
+# this list for required files of the specified programming language using the
+# file extension.
+# Note: The limit for the tree array is 100,000 entries with a maximum size of 7 MB 
+# when getting the file list and using the recursive parameter.
 
 def download_all_repos(res):
     download_repos_from_page(res)
@@ -342,11 +349,6 @@ def download_all_repos(res):
             break
     update_status('')
 
-# For each repo on one page we request list of files in repository and filter the files
-# depending on their file extension.
-# API: https://api.github.com/repos/<owner>/<repo>/git/trees/<master>?recursive=1
-# Note: The limit for the tree array is 100,000 entries with a maximum size of 7 MB 
-# when using the recursive parameter.
 
 def download_repos_from_page(res):
     update_status('Get list of files in repository...')
@@ -356,7 +358,7 @@ def download_repos_from_page(res):
             try:
                 res = get("https://api.github.com/repos/" + repo["full_name"] 
                         + "/git/trees/" + repo["default_branch"] + "?recursive=1")
-            except:
+            except Exception:
                 continue
             
             for file in res.json()['tree']:
@@ -387,7 +389,7 @@ def download_all_commits(repo, file, file_id):
         # Get the list of commits for this file
         commits_url = repo['commits_url'][:-6].replace('#', '%23')
         commits_res = get(commits_url, params={'path': file['path'], 'per_page': 100})
-    except:
+    except Exception:
         return
     download_commits_from_page(commits_res, repo['full_name'],
                                 file['path'], file_id)
@@ -407,7 +409,7 @@ def download_commits_from_page(commits_res, repo_full_name, file_path, file_id):
             try:
                 content_res = get_content("https://raw.githubusercontent.com/" +
                     repo_full_name + "/" + commit['sha'] + "/" + file_path)
-            except:
+            except Exception:
                 continue
 
             # Extract only shas of parents from api response
@@ -423,7 +425,8 @@ def download_commits_from_page(commits_res, repo_full_name, file_path, file_id):
 # one if it doesn't exist yet. The database schema follows the GitHub API
 # response schema. Our 'insert_repo', 'insert_file' and 'insert_comit' functions
 # help to store the items in the database respectively. 'commit' is a reserved 
-# keyword in sqlite, therefore the tablename is 'comit'.
+# keyword in sqlite, therefore the tablename is 'comit'. We also increase our 
+# counter for the sample sizes after each insertion.
 
 db = sqlite3.connect(args.database)
 db.executescript('''
@@ -460,55 +463,44 @@ db.executescript('''
     );
     ''')
 
-# We run the sqlite3 queries in a try...except block to catch any database exceptions.
-# If we catch the DB Error: 'Cannot operate on a closed database.' this usually means
-# that the program was interrupted with ctrl-c. We don't want to print the error traceback
-# in this case therefore we just wait for the signal_handler to come to an end and then exit.
-
 def insert_repo(repo):
-    try:
-        db.execute('''
-            INSERT OR IGNORE INTO repo 
-                ( repo_id, name, full_name, description, url, fork
-                , owner_id, owner_login
-                )
-            VALUES (?,?,?,?,?,?,?,?)
-            ''',
-            ( repo['id']
-            , repo['name']
-            , repo['full_name']
-            , repo['description']
-            , repo['url']
-            , int(repo['fork'])
-            , repo['owner']['id']
-            , repo['owner']['login']
-            ))
-        db.commit()
-    except sqlite3.ProgrammingError as error:
-        return handle_db_error(error, 'insert_repo')
+    db.execute('''
+        INSERT OR IGNORE INTO repo 
+            ( repo_id, name, full_name, description, url, fork
+            , owner_id, owner_login
+            )
+        VALUES (?,?,?,?,?,?,?,?)
+        ''',
+        ( repo['id']
+        , repo['name']
+        , repo['full_name']
+        , repo['description']
+        , repo['url']
+        , int(repo['fork'])
+        , repo['owner']['id']
+        , repo['owner']['login']
+        ))
+    db.commit()
     global sam_repo, total_sam_repo
     sam_repo += 1
     total_sam_repo += 1
 
-# Here we insert a file into the results database. For further computations
-# we check the file_id after insertion and return it.
+# When inserting a file we check the file_id after insertion from the database
+# cursor and return it for further computations.
 
 def insert_file(file,repo_id):
-    try:
-        local_cur = db.execute('''
-            INSERT OR IGNORE INTO file
-                (name, path, sha, repo_id)
-            VALUES (?,?,?,?)
-            ''',
-            ( file['name']
-            , file['path']
-            , file['sha']
-            , repo_id
-            ))
-        file_id = local_cur.lastrowid
-        db.commit()
-    except sqlite3.ProgrammingError as error:
-        return handle_db_error(error, 'insert_file')
+    local_cur = db.execute('''
+        INSERT OR IGNORE INTO file
+            (name, path, sha, repo_id)
+        VALUES (?,?,?,?)
+        ''',
+        ( file['name']
+        , file['path']
+        , file['sha']
+        , repo_id
+        ))
+    file_id = local_cur.lastrowid
+    db.commit()
     global sam_file, total_sam_file
     sam_file += 1
     total_sam_file += 1
@@ -520,69 +512,45 @@ def insert_file(file,repo_id):
 # The parent field stores a list of git_shas that correspond to the parent commits.
 
 def insert_commit(commit,content_res,parents,file_id):
-    try:
-        db.execute('''
-            INSERT OR IGNORE INTO comit
-                (sha, message, size, created, content, parents, file_id)
-            VALUES (?,?,?,?,?,?,?)
-            ''',
-            ( commit['sha']
-            , commit['commit']['message']
-            , len(content_res.content)
-            , commit['commit']['committer']['date']
-            , content_res.text
-            , str(parents)
-            , file_id
-            ))
-        db.commit()
-    except sqlite3.ProgrammingError as error:
-        return handle_db_error(error, 'insert_commit')
+    db.execute('''
+        INSERT OR IGNORE INTO comit
+            (sha, message, size, created, content, parents, file_id)
+        VALUES (?,?,?,?,?,?,?)
+        ''',
+        ( commit['sha']
+        , commit['commit']['message']
+        , len(content_res.content)
+        , commit['commit']['committer']['date']
+        , content_res.text
+        , str(parents)
+        , file_id
+        ))
+    db.commit()
     global sam_comit, total_sam_comit
     sam_comit += 1
     total_sam_comit += 1
 
 def known_repo(item):
-    try:
-        cur = db.execute("select count(*) from repo where full_name = ? and repo_id = ?",
-            (item['full_name'], item['id']))
-    except sqlite3.ProgrammingError as error:
-        return handle_db_error(error, 'known_repo')
+    cur = db.execute("select count(*) from repo where full_name = ? and repo_id = ?",
+        (item['full_name'], item['id']))
     return cur.fetchone()[0] == 1
 
 def known_file(item, repo_id):
-    try:
-        cur = db.execute("select count(*) from file where path = ? and repo_id = ?",
-            (item['path'], repo_id))
-    except sqlite3.ProgrammingError as error:
-        return handle_db_error(error, 'known_file')
+    cur = db.execute("select count(*) from file where path = ? and repo_id = ?",
+        (item['path'], repo_id))
     return cur.fetchone()[0] == 1
     
 
 def known_commit(item, file_id):
-    try:
-        cur = db.execute("select count(*) from comit where sha = ? and file_id = ?",
-            (item['sha'], file_id))
-    except sqlite3.ProgrammingError as error:
-        return handle_db_error(error, 'known_commit')
+    cur = db.execute("select count(*) from comit where sha = ? and file_id = ?",
+        (item['sha'], file_id))
     return cur.fetchone()[0] == 1
 
-# Here we have a helper function to handle the potential DB Errors.
-
-def handle_db_error(error, origin):
-    if str(error.args) == "('Cannot operate on a closed database.',)":
-        return sys.exit(0)
-    else:
-        print(f'{origin}: DB Exception is {error.args}')
-        db.commit()
-        db.close()
-        return sys.exit(0)
 
 #-------------------------------------------------------------------------------
 
 # Now we can finally get into it! 
 
-# We do not get an estimation of the entire population in this version of the
-# script because it wouldn't make sense.
 status_msg = 'Initialize Program'
 print_footer()
 total_sam_repo = 0
@@ -638,8 +606,6 @@ def signal_handler(sig,frame):
     db.close()
     statsfile.flush()
     statsfile.close()
-    global start
-    global api_calls
     print("\nThe program took " + time.strftime("%H:%M:%S", 
         time.gmtime((time.time())-start)) + " to execute (Hours:Minutes:Seconds).")
     print("The program has requested " + str(api_calls) + " API calls from GitHub.")
@@ -665,7 +631,7 @@ while strat_first <= args.max_size:
     # We check whether the search should filter for a license or not.
 
     if not args.licensed:
-        # non licensed search
+
         update_status('Searching...')
         res = search(strat_first, strat_last)
         pop_repo = int(res.json()['total_count'])
@@ -698,11 +664,14 @@ while strat_first <= args.max_size:
 
 
     else:
-        # only licensed search
-        for lics in licenses:
-            update_status(f'Searching for {lics} licensed repositories...')
-            current_lics = lics
-            res = search(strat_first, strat_last,license=lics)
+        
+        # Within the strata we loop through the list of licenses and search for
+        # files with the 'license' filter.
+
+        for lic in licenses:
+            update_status(f'Searching for >>{lic}<< licensed repositories...')
+            current_license = lic
+            res = search(strat_first, strat_last,license=lic)
             current_cumulative_pop = pop_repo
             pop_repo += int(res.json()['total_count'])
             clear_footer()
@@ -711,18 +680,9 @@ while strat_first <= args.max_size:
 
             download_all_repos(res)
 
-            # To stretch the 1000-results-per-query limit, we can simply repeat the
-            # search with the sort order reversed, thus sampling the stratum population
-            # from both ends, so to speak. This gives us a maximum sample size of 2000
-            # per stratum.
-
             if pop_repo > 1000:
                 update_status('Repeating search with reverse sort order...')
-                res = search(strat_first, strat_last, order='desc',license=lics)
-                
-                # Due to the instability of search results, we might get a different
-                # population count on the second query. We will take the maximum of the
-                # two population counts for this stratum as a conservative estimate.
+                res = search(strat_first, strat_last, order='desc',license=lic)
 
                 pop2 = int(res.json()['total_count']) + current_cumulative_pop
                 pop_repo = max(pop_repo,pop2)
@@ -731,8 +691,6 @@ while strat_first <= args.max_size:
                 print_footer()
 
                 download_all_repos(res)
-
-
 
 
     # After we've sampled as much as we could of the current strata, commit it
