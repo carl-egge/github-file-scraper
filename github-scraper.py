@@ -98,8 +98,16 @@ if args.max_size > MAX_FILE_SIZE:
 if args.stratum_size < 1:
     sys.exit('stratum-size must be positive')
 if not args.github_token:
-    sys.exit('missing environment variable GITHUB_TOKEN')
+    # sys.exit('missing environment variable GITHUB_TOKEN')
+    confirm_no_token = input('''No GitHub TOKEN was specified or found in the environment variables.
+Do you want to run the program without a token (this will slow the program down)? [y/N]\n''')
+    if confirm_no_token.lower() == 'yes' or confirm_no_token.lower() == 'y':
+        print("\nThe program will now run without a TOKEN (ratelimit at 60 requests per hour).\n")
+        time.sleep(2)
+    else:
+        sys.exit("\nYou can specifiy a personal access token for GitHub using the '--github-token' argument.")
             
+
 #-------------------------------------------------------------------------------
 
 # The GitHub Code Search API is limited to 1000 results per query. To get around
@@ -192,6 +200,7 @@ def print_footer():
         size = '%d' % args.min_size
     else:
         size = '%d .. %d' % (args.min_size, args.max_size)
+    ratelimit = 60 if not args.github_token else 5000
     tot_sam_repo_str = str(total_sam_repo) if total_sam_repo > -1 else ''
     tot_sam_file_str = str(total_sam_file) if total_sam_file > -1 else ''
     tot_sam_comit_str = str(total_sam_comit) if total_sam_comit > -1 else ''
@@ -202,7 +211,7 @@ def print_footer():
         tot_sam_file_str, tot_sam_comit_str, ''))
     print()
     print('Current queried license: ', current_license) if args.licensed else print()
-    print('Current GitHub ratelimit: %d / ~5000' % (rate_used))
+    print('Current GitHub ratelimit: %d / ~%d' % (rate_used, ratelimit))
     print()
     print(status_msg)
 
@@ -231,10 +240,12 @@ def update_status(msg):
 def get(url, params={}):
     global api_calls, rate_used
     if args.throttle:
-        time.sleep(0.4) # throttle requests to ~5000 per hour: 0.72
+        # throttle requests to ~5000 per hour: 0.72
+        sleep = 60 if not args.github_token else 0.72
+        time.sleep(sleep)
+    auth_headers = {} if not args.github_token else {'Authorization': f'token {args.github_token}'}
     try:
-        res = requests.get(url, params, headers=
-            {'Authorization': f'token {args.github_token}'})
+        res = requests.get(url, params, headers=auth_headers)
     except requests.ConnectionError:
         print("\nERROR :: There seems to be a problem with your internet connection.")
         return signal_handler(0,0)
@@ -242,6 +253,8 @@ def get(url, params={}):
     rate_used = (int(res.headers.get('X-RateLimit-Used')) if
         res.headers.get('X-RateLimit-Used') != None else 0)
     if res.status_code == 403:
+        clear_footer()
+        print_footer()
         return handle_rate_limit_error(res)
     else:
         if res.status_code != 200:
@@ -256,6 +269,8 @@ def handle_rate_limit_error(res):
     else: 
         t = int(res.headers.get('Retry-After', 60))
     err_msg = f'Exceeded rate limit. Retrying after {t} seconds...'
+    if not args.github_token:
+        err_msg += ' Try running the script with a GitHub TOKEN.'
     old_msg = update_status(err_msg)
     time.sleep(t)
     update_status(old_msg)
