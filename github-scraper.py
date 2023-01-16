@@ -421,6 +421,16 @@ def download_commits_from_page(commits_res, repo_full_name, file_path, file_id):
             for p in commit['parents']:
                 parents.append(p['sha'])
             insert_commit(commit, content_res, parents, file_id)
+
+# For convenience, we define a short function that uses a regex to get the 
+# compiler version of a Solidity file.
+
+def find_compiler_version(text):
+    compiler_vers = ""
+    compiler_re = re.search(r'pragma solidity [<>^]?=?\s*([\d.]+)', text)
+    if compiler_re != None:
+        compiler_vers = compiler_re.group(1)
+    return compiler_vers
     
 
 #-------------------------------------------------------------------------------
@@ -460,6 +470,7 @@ db.executescript('''
     , size INTEGER NOT NULL
     , created DATETIME DEFAULT CURRENT_TIMESTAMP
     , content TEXT NOT NULL
+    , compiler_version TEXT NOT NULL
     , parents TEXT NOT NULL
     , file_id INTEGER NOT NULL
     , FOREIGN KEY (file_id) REFERENCES file(file_id)
@@ -518,14 +529,15 @@ def insert_file(file,repo_id):
 def insert_commit(commit,content_res,parents,file_id):
     db.execute('''
         INSERT OR IGNORE INTO comit
-            (sha, message, size, created, content, parents, file_id)
-        VALUES (?,?,?,?,?,?,?)
+            (sha, message, size, created, content, compiler_version, parents, file_id)
+        VALUES (?,?,?,?,?,?,?,?)
         ''',
         ( commit['sha']
         , commit['commit']['message']
         , len(content_res.content)
         , commit['commit']['committer']['date']
         , content_res.text
+        , find_compiler_version(content_res.text)
         , str(parents)
         , file_id
         ))
