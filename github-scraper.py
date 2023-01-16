@@ -25,16 +25,16 @@
 
 ############################  GITHUB FILE SCRAPER  #############################
 
-######## VERSION: Search for User-specified language
+######## VERSION: Search for Solidity Smart Contracts
 #    ----> Search Logic: GitHub Repository Search Endpoint
 
 # This script is a modification of the github-searcher from Michael Schröder and
-# Jürgen Cito. It exhaustively samples GitHub Repo Search results and stores the 
-# files of a specified language including their commit history and their content.
+# Jürgen Cito. It exhaustively samples GitHub Repo Search results and stores
+# Solidity files including their commit history and their content.
 
 # This script was developed by Carl Egge on behalf of the Christian Doppler Labor.
 # Its main purpose is to build a local database of Solidity smart contracts and
-# their versions. It is build in a semi-chronical readable fashion.
+# their versions. It is structured in a semi-chronological, readable form.
 
 import os, sys, argparse, shutil, time, signal, re
 import sqlite3, csv
@@ -49,17 +49,7 @@ os.environ['COLUMNS'] = str(shutil.get_terminal_size().columns)
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawDescriptionHelpFormatter,
     description='''Exhaustively sample the GitHub Code Search API and 
-        store files and commits of a given programming language.''')
-
-parser.add_argument('-l', '--language', metavar='LANGUAGE',
-    default='Solidity',
-    help='''Please provide the name of the programming language that you
-        want to search for (default: Solidity)''')
-
-parser.add_argument('-e', '--extension', metavar='EXTENSION',
-    default='sol',
-    help='''Please provide the file extension corresponding to the programming
-        language that should be sampled without the dot (default: sol)''')
+store files and commits of Solidity smart contracts.''')
 
 parser.add_argument('--database', metavar='FILE', default='results.db', 
     help='search results database file (default: results.db)')
@@ -109,7 +99,7 @@ if args.stratum_size < 1:
     sys.exit('stratum-size must be positive')
 if not args.github_token:
     sys.exit('missing environment variable GITHUB_TOKEN')
-
+            
 #-------------------------------------------------------------------------------
 
 # The GitHub Code Search API is limited to 1000 results per query. To get around
@@ -311,7 +301,7 @@ def handle_log_response(res,file="log.txt"):
 def search(a,b,order='asc',license="no"):
     q_fork = 'true' if args.forks else 'false'
     q_license = f'license:{license}' if license != "no" else ''
-    query = f'language:{args.language} size:{a}..{b} fork:{q_fork} {q_license}'
+    query = f'language:Solidity size:{a}..{b} fork:{q_fork} {q_license}'
     
     return get('https://api.github.com/search/repositories',
         params={'q': query, 'sort': 'updated', 'order': order, 'per_page': 100})
@@ -331,8 +321,7 @@ def search(a,b,order='asc',license="no"):
 
 # DOWNLOAD REPOS
 # For each repository we request a list of files from the master branch and filter 
-# this list for required files of the specified programming language using the
-# file extension.
+# this list for Solidity files using the file extension (.sol).
 # Note: The limit for the tree array is 100,000 entries with a maximum size of 7 MB 
 # when getting the file list and using the recursive parameter.
 
@@ -362,7 +351,7 @@ def download_repos_from_page(res):
                 continue
             
             for file in res.json()['tree']:
-                if(file['type'] == "blob" and bool(re.search(fr'\w\.{args.extension}$', file['path']))):
+                if(file['type'] == "blob" and bool(re.search(fr'\w\.sol$', file['path']))):
                     # Extract the file name from the path using regex
                     name_re = re.search(r'[\w-]+?(?=\.)', file['path'])
                     file['name'] = name_re.group(0) if name_re != None else file['path']
