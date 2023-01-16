@@ -148,12 +148,14 @@ start = time.time()
 rate_used = 0
 api_calls = 0
 
-# Here we store list of opensource liscense keys for GitHub API. This list only
-# includes copyleft licenses that have no condition or only the condition to 
-# include a open source license again ('include-copyright') when redistributing
-# the work.
+# Here we store list of opensource liscense keys for GitHub API. Please note that
+# this list includes viral licenses that require a user to include the same license
+# in a project if a specific file from the result set should be modified and 
+# redistributed.
 
-licenses = ['mit', 'unlicense', 'cc0-1.0', 'bsd-2-clause', 'bsd-3-clause']
+licenses = ['apache-2.0', 'agpl-3.0', 'bsd-2-clause', 'bsd-3-clause', 'bsl-1.0',
+            'cc0-1.0', 'epl-2.0', 'gpl-2.0', 'gpl-3.0', 'lgpl-2.1', 'mit',
+            'mpl-2.0', 'unlicense']
 current_license = ''
 current_cumulative_pop = 0
 
