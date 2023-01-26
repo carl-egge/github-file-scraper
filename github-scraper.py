@@ -25,13 +25,11 @@
 
 ############################  GITHUB FILE SCRAPER  #############################
 
-######## VERSION: Search for Solidity Smart Contracts
-#    ----> Search Logic: GitHub Repository Search Endpoint
+## VERSION: Search for Solidity Smart Contracts
 
 # This script is a modification of the github-searcher from Michael Schröder and
 # Jürgen Cito. It exhaustively samples GitHub Repo Search results and stores
 # Solidity files including their commit history and their content.
-
 # This script was developed by Carl Egge on behalf of the Christian Doppler Labor.
 # Its main purpose is to build a local database of Solidity smart contracts and
 # their versions. It is structured in a semi-chronological, readable form.
@@ -98,7 +96,6 @@ if args.max_size > MAX_FILE_SIZE:
 if args.stratum_size < 1:
     sys.exit('stratum-size must be positive')
 if not args.github_token:
-    # sys.exit('missing environment variable GITHUB_TOKEN')
     confirm_no_token = input('''No GitHub TOKEN was specified or found in the environment variables.
 Do you want to run the program without a token (this will slow the program down)? [y/N]\n''')
     if confirm_no_token.lower() == 'yes' or confirm_no_token.lower() == 'y':
@@ -242,7 +239,7 @@ def update_status(msg):
 def get(url, params={}):
     global api_calls, rate_used
     if args.throttle:
-        # throttle requests to ~5000 per hour: 0.72
+        # throttle requests to ~5000 per hour
         sleep = 60 if not args.github_token else 0.72
         time.sleep(sleep)
     auth_headers = {} if not args.github_token else {'Authorization': f'token {args.github_token}'}
@@ -383,12 +380,12 @@ def download_repos_from_page(res):
             return
 
 # DOWNLOAD COMMITS
-# For each of the files a list of commits is requested from the Github API.
+# For each of the files a list of commits is requested from the Github API 
+# using the path as query on the commits endpoint.
 # The list of commits will again be paginated (with 100 elements per page).
 # Hence we loop over all pages and each of the commits on the pages. For a
 # commit the file content is then downloaded from the Raw Github API that 
-# has no rate limit. In the end the commits are also stored in the results
-# database, if they are not already in there.
+# has no rate limit.
 
 def download_all_commits(repo, file, file_id):
     try:
@@ -422,18 +419,7 @@ def download_commits_from_page(commits_res, repo_full_name, file_path, file_id):
             parents = []
             for p in commit['parents']:
                 parents.append(p['sha'])
-            insert_commit(commit, content_res, parents, file_id)
-
-# For convenience, we define a short function that uses a regex to get the 
-# compiler version of a Solidity file.
-
-def find_compiler_version(text):
-    compiler_vers = ""
-    compiler_re = re.search(r'pragma solidity [<>^]?=?\s*([\d.]+)', text)
-    if compiler_re != None:
-        compiler_vers = compiler_re.group(1)
-    return compiler_vers
-    
+            insert_commit(commit, content_res, parents, file_id)    
 
 #-------------------------------------------------------------------------------
 
@@ -564,6 +550,15 @@ def known_commit(item, file_id):
         (item['sha'], file_id))
     return cur.fetchone()[0] == 1
 
+# For convenience, we define a short function that uses a regex to get the 
+# compiler version of a Solidity file.
+
+def find_compiler_version(text):
+    compiler_vers = ""
+    compiler_re = re.search(r'pragma solidity [<>^]?=?\s*([\d.]+)', text)
+    if compiler_re != None:
+        compiler_vers = compiler_re.group(1)
+    return compiler_vers
 
 #-------------------------------------------------------------------------------
 
