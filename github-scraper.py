@@ -25,16 +25,14 @@
 
 ############################  GITHUB FILE SCRAPER  #############################
 
-######## VERSION: Search for User-specified language
-#    ----> Search Logic: GitHub Repository Search Endpoint
+## VERSION: Search for User-specified language
 
 # This script is a modification of the github-searcher from Michael Schröder and
 # Jürgen Cito. It exhaustively samples GitHub Repo Search results and stores the 
 # files of a specified language including their commit history and their content.
-
 # This script was developed by Carl Egge on behalf of the Christian Doppler Labor.
-# Its main purpose is to build a local database of Solidity smart contracts and
-# their versions. It is build in a semi-chronical readable fashion.
+# Its main purpose is to build a local database of source code files and their 
+# versions. It is structured in a semi-chronological, readable form.
 
 import os, sys, argparse, shutil, time, signal, re
 import sqlite3, csv
@@ -108,7 +106,13 @@ if args.max_size > MAX_FILE_SIZE:
 if args.stratum_size < 1:
     sys.exit('stratum-size must be positive')
 if not args.github_token:
-    sys.exit('missing environment variable GITHUB_TOKEN')
+    confirm_no_token = input('''No GitHub TOKEN was specified or found in the environment variables.
+Do you want to run the program without a token (this will slow the program down)? [y/N]\n''')
+    if confirm_no_token.lower() == 'yes' or confirm_no_token.lower() == 'y':
+        print("\nThe program will now run without a TOKEN (ratelimit at 60 requests per hour).\n")
+        time.sleep(2)
+    else:
+        sys.exit("\nYou can specifiy a personal access token for GitHub using the '--github-token' argument.")
 
 #-------------------------------------------------------------------------------
 
@@ -155,7 +159,9 @@ api_calls = 0
 # include a open source license again ('include-copyright') when redistributing
 # the work.
 
-licenses = ['mit', 'unlicense', 'cc0-1.0', 'bsd-2-clause', 'bsd-3-clause']
+licenses = ['apache-2.0', 'agpl-3.0', 'bsd-2-clause', 'bsd-3-clause', 'bsl-1.0',
+            'cc0-1.0', 'epl-2.0', 'gpl-2.0', 'gpl-3.0', 'lgpl-2.1', 'mit',
+            'mpl-2.0', 'unlicense']
 current_license = ''
 current_cumulative_pop = 0
 
@@ -241,10 +247,11 @@ def update_status(msg):
 def get(url, params={}):
     global api_calls, rate_used
     if args.throttle:
-        time.sleep(0.4) # throttle requests to ~5000 per hour: 0.72
+        sleep = 60 if not args.github_token else 0.72
+        time.sleep(sleep)
+    auth_headers = {} if not args.github_token else {'Authorization': f'token {args.github_token}'}
     try:
-        res = requests.get(url, params, headers=
-            {'Authorization': f'token {args.github_token}'})
+        res = requests.get(url, params, headers=auth_headers)
     except requests.ConnectionError:
         print("\nERROR :: There seems to be a problem with your internet connection.")
         return signal_handler(0,0)
@@ -252,6 +259,8 @@ def get(url, params={}):
     rate_used = (int(res.headers.get('X-RateLimit-Used')) if
         res.headers.get('X-RateLimit-Used') != None else 0)
     if res.status_code == 403:
+        clear_footer()
+        print_footer()
         return handle_rate_limit_error(res)
     else:
         if res.status_code != 200:
@@ -266,6 +275,8 @@ def handle_rate_limit_error(res):
     else: 
         t = int(res.headers.get('Retry-After', 60))
     err_msg = f'Exceeded rate limit. Retrying after {t} seconds...'
+    if not args.github_token:
+        err_msg += ' Try running the script with a GitHub TOKEN.'
     old_msg = update_status(err_msg)
     time.sleep(t)
     update_status(old_msg)
@@ -331,8 +342,7 @@ def search(a,b,order='asc',license="no"):
 
 # DOWNLOAD REPOS
 # For each repository we request a list of files from the master branch and filter 
-# this list for required files of the specified programming language using the
-# file extension.
+# this list for files using the given file extension (args.extension).
 # Note: The limit for the tree array is 100,000 entries with a maximum size of 7 MB 
 # when getting the file list and using the recursive parameter.
 
@@ -377,12 +387,12 @@ def download_repos_from_page(res):
             return
 
 # DOWNLOAD COMMITS
-# For each of the files a list of commits is requested from the Github API.
+# For each of the files a list of commits is requested from the Github API 
+# using the path as query on the commits endpoint.
 # The list of commits will again be paginated (with 100 elements per page).
 # Hence we loop over all pages and each of the commits on the pages. For a
 # commit the file content is then downloaded from the Raw Github API that 
-# has no rate limit. In the end the commits are also stored in the results
-# database, if they are not already in there.
+# has no rate limit.
 
 def download_all_commits(repo, file, file_id):
     try:
