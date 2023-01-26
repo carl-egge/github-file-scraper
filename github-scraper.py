@@ -1,7 +1,8 @@
 #-------------------------------------------------------------------------------
 # MIT License
 #
-# Copyright (c) 2019 Michael Schröder, Jürgen Cito, Carl Egge, Stefan Schulte
+# Copyright (c) 2019 Michael Schröder, Jürgen Cito, Carl Egge, Stefan Schulte, 
+# Avik Banerjee
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -24,16 +25,17 @@
 
 ############################  GITHUB FILE SCRAPER  #############################
 
+## VERSION: GitHub Code Search + Download of repo, file and commits
+
 # This script is a modification of the github-searcher from Michael Schröder and
 # Jürgen Cito. It exhaustively samples GitHub Code Search results and stores the 
 # files including their commit history and their content.
-
 # This script was developed by Carl Egge on behalf of the Christian Doppler Labor.
 # Its main purpose is to build a local database of Solidity smart contracts and
 # their versions.
 
 import os, sys, argparse, shutil, time, signal
-import base64, sqlite3, csv
+import sqlite3, csv
 import requests
 
 # Before we get to the fun stuff, we need to parse and validate arguments, check
@@ -71,6 +73,9 @@ parser.add_argument('--stratum-size', metavar='BYTES', type=int, default=1,
 parser.add_argument('--no-throttle', dest='throttle', action='store_false', 
     help='disable request throttling')
 
+parser.add_argument('--search-forks', dest='forks', action='store_true', 
+    help='''add 'fork:true' to query which includes forked repos in the result''')
+
 parser.add_argument('--github-token', metavar='TOKEN', 
     default=os.environ.get('GITHUB_TOKEN'), 
     help='''personal access token for GitHub 
@@ -89,7 +94,13 @@ if args.max_size > MAX_FILE_SIZE:
 if args.stratum_size < 1:
     sys.exit('stratum-size must be positive')
 if not args.github_token:
-    sys.exit('missing environment variable GITHUB_TOKEN')
+    confirm_no_token = input('''No GitHub TOKEN was specified or found in the environment variables.
+Do you want to run the program without a token (this will slow the program down)? [y/N]\n''')
+    if confirm_no_token.lower() == 'yes' or confirm_no_token.lower() == 'y':
+        print("\nThe program will now run without a TOKEN (ratelimit at 60 requests per hour).\n")
+        time.sleep(2)
+    else:
+        sys.exit("\nYou can specifiy a personal access token for GitHub using the '--github-token' argument.")
 
 #-------------------------------------------------------------------------------
 
@@ -106,22 +117,21 @@ if not args.github_token:
 strat_first = args.min_size
 strat_last = min(args.min_size + args.stratum_size - 1, args.max_size)
 
-# ...as well as the current stratum's population and the amount of files sampled
-# so far (in the current stratum). A value of -1 indicates "unknown".
+# ...as well as the current stratum's population of repositories and the amount
+# of repositories/files/commits that have been sampled so far (in the current 
+# stratum). A value of -1 indicates "unknown".
 
-# TODO: Optionally a global counter for the current sample of commits could
-# be introduced
+pop_files = -1
+sam_repo = -1
+sam_file = -1
+sam_comit = -1
 
-pop = -1
-sam = -1
+# We also keep track of the total (cumulative) sample sizes so far, and we store 
+# it for the downloaded repos/files/commits respectivley.
 
-# We also have an estimate of the overall population (although it's gonna be
-# very unreliable), and we keep track of the total (cumulative) sample size so
-# far, and we store the (cumulative) amount of downloaded commits.
-
-est_pop = -1
-total_sam = -1
-total_com = 0
+total_sam_repo = -1
+total_sam_file = -1
+total_sam_comit = -1
 
 # We also want to keep track of the execution time of the script, therefore we 
 # store the starting time. Additionally we store the ratelimit-used information
@@ -141,9 +151,9 @@ api_calls = 0
 
 # First, let's just print the table header.
 
-print('                 ┌────────────┬────────────┐')
-print('                 │ population │   sample   │')
-print('                 ├────────────┼────────────┤')
+print('                 ┌────────────┬────────────┬────────────┬────────────┐')
+print('                 │  pop file  │  sam repo  │  sam file  │ sam commit │')
+print('                 ├────────────┼────────────┼────────────┼────────────┤')
 
 # Now we define some functions to print information about the current stratum.
 # By default, this will simply add a new line to the output. However, to be able
@@ -156,10 +166,13 @@ def print_stratum(overwrite=False):
         size = '%d' % strat_first
     else:
         size = '%d .. %d' % (strat_first, strat_last)
-    pop_str = str(pop) if pop > -1 else ''
-    sam_str = str(sam) if sam > -1 else ''
-    per = '%6.2f%%' % (sam/pop*100) if pop > 0 else ''
-    print('%16s │ %10s │ %10s │ %6s' % (size, pop_str, sam_str, per))
+    pop_str = str(pop_files) if pop_files > -1 else ''
+    sam_repo_str = str(sam_repo) if sam_repo > -1 else ''
+    sam_file_str = str(sam_file) if sam_file > -1 else ''
+    sam_comit_str = str(sam_comit) if sam_comit > -1 else ''
+    per = '%6.2f%%' % (sam_repo/pop_files*100) if pop_files > 0 else ''
+    print('%16s │ %10s │ %10s │ %10s │ %10s │ %6s' % (size, pop_str, sam_repo_str, 
+        sam_file_str, sam_comit_str, per))
 
 # Another function will print the footer of the table, including summary
 # statistics and the status message. Here we provide a separate function to
@@ -172,22 +185,21 @@ def print_footer():
         size = '%d' % args.min_size
     else:
         size = '%d .. %d' % (args.min_size, args.max_size)
-    pop_str = str(est_pop) if est_pop > -1 else ''
-    sam_str = str(total_sam) if total_sam > -1 else ''
-    per = '%6.2f%%' % (total_sam/est_pop*100) if est_pop > 0 else ''
-    print('                 ├────────────┼────────────┤')
-    print('                 │ population │   sample   │')
-    print('                 └────────────┴────────────┘')
-    print('%16s   %10s   %10s   %6s' % (size, pop_str, sam_str, per))
-    print('                   (estimated)') if est_pop > -1 else print()
+    tot_sam_repo_str = str(total_sam_repo) if total_sam_repo > -1 else ''
+    tot_sam_file_str = str(total_sam_file) if total_sam_file > -1 else ''
+    tot_sam_comit_str = str(total_sam_comit) if total_sam_comit > -1 else ''
+    print('                 ├────────────┼────────────┼────────────┼────────────┤')
+    print('                 │  pop file  │  sam repo  │  sam file  │ sam commit │')
+    print('                 └────────────┴────────────┴────────────┴────────────┘')
+    print('%16s   %10s   %10s   %10s   %10s   %6s' % (size, '', tot_sam_repo_str,
+        tot_sam_file_str, tot_sam_comit_str, ''))
     print()
-    print('Total of downloaded commits: ', str(total_com))
-    print('Current GitHub Ratelimit: %d / ~5000' % (rate_used))
+    print('Current GitHub ratelimit: %d / ~5000' % (rate_used))
     print()
     print(status_msg)
 
 def clear_footer():
-    sys.stdout.write(f'\033[10F\r\033[J')
+    sys.stdout.write(f'\033[9F\r\033[J')
 
 # For convenience, we also have function for just updating the status message.
 # It returns the old message so it can be restored later if desired.
@@ -211,20 +223,24 @@ def update_status(msg):
 def get(url, params={}):
     global api_calls, rate_used
     if args.throttle:
-        time.sleep(0.72) # throttle requests to ~5000 per hour
-    res = requests.get(url, params, headers=
-        {'Authorization': f'token {args.github_token}'})
+        sleep = 60 if not args.github_token else 0.72
+        time.sleep(sleep)
+    auth_headers = {} if not args.github_token else {'Authorization': f'token {args.github_token}'}
+    try:
+        res = requests.get(url, params, headers=auth_headers)
+    except requests.ConnectionError:
+        print("\nERROR :: There seems to be a problem with your internet connection.")
+        return signal_handler(0,0)
     api_calls += 1
-    rate_used = int(res.headers.get('X-RateLimit-Used'))
+    rate_used = (int(res.headers.get('X-RateLimit-Used')) if
+        res.headers.get('X-RateLimit-Used') != None else 0)
     if res.status_code == 403:
+        clear_footer()
+        print_footer()
         return handle_rate_limit_error(res)
     else:
-        # Write Request to Log
-        logger = open("log.txt", "a")
-        logging_str = ("\n\nTime: " + time.strftime("%m/%d/%Y, %H:%M:%S", time.localtime()) 
-            + "\nRequest: " + str(res.url) + "\nStatus: "+ str(res.status_code))
-        logger.write(logging_str)
-        logger.close()
+        if res.status_code != 200:
+            handle_log_response(res)
         res.raise_for_status()
         return res
 
@@ -234,40 +250,64 @@ def handle_rate_limit_error(res):
         t = max(0, int(int(t) - time.time()))
     else: 
         t = int(res.headers.get('Retry-After', 60))
-    l = res.res.headers.get('X-RateLimit-Limit')
-    if (l is not None and l == 30):
-        # Secondary Rate Limit Error so we increase the buffing time
-        t += 60
-
-    # Write Error to Log file
-    logger = open("log.txt", "a")
-    logging_str = ("\n\nERROR :: Time: " + time.strftime("%m/%d/%Y, %H:%M:%S", time.localtime()) 
-            + "\nRequest: " + str(res.url) + "\nStatus: 403\nMessage: " + res.json()['message'])
-    logger.write(logging_str)
-    logger.close()
-
-    # Write Error to output
     err_msg = f'Exceeded rate limit. Retrying after {t} seconds...'
+    if not args.github_token:
+        err_msg += ' Try running the script with a GitHub TOKEN.'
     old_msg = update_status(err_msg)
     time.sleep(t)
     update_status(old_msg)
     return get(res.url)
 
+# In order to reduce the amount of GitHub API calls further we use the raw content API
+# from GitHub to request the content of the single commits. This also reduces the need
+# to throttle and hence makes the script theoretically faster. We define a function that
+# helps to request data from the 'raw.githubusercontent.com/' API.
+
+def get_content(url):
+    try:
+        res = requests.get(url)
+    except requests.ConnectionError:
+        print("\nERROR :: There seems to be a problem with your internet connection.")
+        return signal_handler(0,0)
+    if res.status_code != 200:
+        handle_log_response(res)
+    res.raise_for_status()
+    return res
+
+# This helper function can be used to write information on the Response from a request 
+# into a log-file (default: log.txt).
+
+def handle_log_response(res,file="log.txt"):
+    err_msg = f'Request response error with status: {res.status_code} (for details see {file})'
+    old_msg = update_status(err_msg)
+    logger = open(file, "a")
+    logging_str =  "\n\nTime: " + time.strftime("%m/%d/%Y, %H:%M:%S", time.localtime()) 
+    logging_str += "\nRequest: " + str(res.url) + "\nStatus: "+ str(res.status_code)
+    logging_str += "\nMessage: " + res.json()['message'] if res.status_code != 200 else ''
+    logger.write(logging_str)
+    logger.close()
+    time.sleep(1.5)
+    update_status(old_msg)
+
 # We also define a convenient function to do the code search for a specific
 # stratum. Note that we sort the search results by how recently a file has been
-# indexed by GitHub.
+# indexed by GitHub. We append search criteria 'fork' depending on the user input 
+# to refine the search results.
 
 def search(a,b,order='asc'):
+    q_fork = 'true' if args.forks else 'false'
+
     return get('https://api.github.com/search/code',
-               params={'q': f'{args.query} size:{a}..{b}', 
+               params={'q': f'{args.query} size:{a}..{b} fork:{q_fork}',
                 'sort': 'indexed', 'order': order, 'per_page': 100})
 
-# To download all files returned by a code search (up to the limit of 1000
-# imposed by GitHub), we need to deal with pagination. On each page, we loop 
-# through all files and add them and their metadata to our results database 
-# (which will be set up in the next section), provided they're not already in 
-# the database (which can happen when continuing a previous search). 
-# 
+#-------------------------------------------------------------------------------
+
+# To download all repos/files/commits returned by a code search (up to the limit 
+# of 1000 repo search results imposed by GitHub), we need to deal with pagination.
+# On each page, we loop through all items and add them and their metadata to our
+# results database (which will be set up in the next section), provided they're 
+# not already in the database (which can happen when continuing a previous search).
 # For each of the files a list of commits is requested from the Github API.
 # The list of commits will again be paginated (with 100 elements per page).
 # Hence we loop over all pages and each of the commits on the pages. For a
@@ -278,76 +318,69 @@ def search(a,b,order='asc'):
 # Also, if any of the files or commits can not be downloaded, for whatever
 # reason, they are simply skipped over and count as not sampled.
 
+# DOWNLOAD FILES
+
 def download_all_files(res):
-    global pop
     download_files_from_page(res)
     while 'next' in res.links:
         update_status('Getting next page of search results...')
+        global pop_files
         res = get(res.links['next']['url'])
         pop2 = res.json()['total_count']
-        pop = max(pop,pop2)
+        pop_files = max(pop_files,pop2)
         download_files_from_page(res)
-        if sam >= pop:
+        if sam_file >= pop_files:
             break
     update_status('')
 
 def download_files_from_page(res):
-    global sam, total_sam
     update_status('Downloading files...')
-    for item in res.json()['items']:
-        if not known_file(item):
-            repo = item['repository']
+    for file in res.json()['items']:
+        if not known_file(file):
+            repo = file['repository']
             insert_repo(repo)
-            file_id = insert_file(item, repo['id'])
-            try:
-                download_all_commits(item, file_id)
-            except KeyboardInterrupt:
-                signal_handler()
-            else:
-                continue
-        sam += 1
-        total_sam += 1
+            file_id = insert_file(file, repo['id'])
+            download_all_commits(repo, file, file_id)
         clear_footer()
         print_stratum(overwrite=True)
         print_footer()
-        if sam >= pop:
+        if sam_file >= pop_files:
             return
 
-def download_all_commits(item, file_id):
-    # Get the list of commits for this file
-    commits_url = item['repository']['commits_url'][:-6].replace('#', '%23')
-    commits_res = get(commits_url, params={'path': item['path'], 'per_page': 100})
-    download_commits_from_page(commits_res, item['repository']['full_name'],
-                                item['path'], file_id)
-    # If more than 100 commits exist we loop over the pages of commits
+# DOWNLOAD COMMITS 
+
+def download_all_commits(repo, file, file_id):
+    try:
+        # Get the list of commits for this file
+        commits_url = repo['commits_url'][:-6].replace('#', '%23')
+        commits_res = get(commits_url, params={'path': file['path'], 'per_page': 100})
+    except Exception:
+        return
+    download_commits_from_page(commits_res, repo['full_name'],
+                                file['path'], file_id)
     while 'next' in commits_res.links:
         update_status('Getting next page of commits...')
         commits_res = get(commits_res.links['next']['url'])
-        download_commits_from_page(commits_res, item['repository']['full_name'],
-                                    item['path'], file_id)
+        download_commits_from_page(commits_res, repo['full_name'],
+                                    file['path'], file_id)
     update_status('')
 
 def download_commits_from_page(commits_res, repo_full_name, file_path, file_id):
     count_commits = str(len(commits_res.json())) if len(commits_res.json()) < 100 else "100+"
     update_status('Downloading ' + count_commits + ' commits...')
     for commit in commits_res.json():
-        try:
-            if not known_commit(commit, file_id):
-                # Try to get the file content from the raw API (no rate limit)
-                try:
-                    content_res = requests.get("https://raw.githubusercontent.com/" +
-                        repo_full_name + "/" + commit['sha'] + "/" + file_path)
-                except:
-                    continue
-                # Extract only shas of parents from api response
-                parents = []
-                for p in commit['parents']:
-                    parents.append(p['sha'])
-                insert_commit(commit, content_res, parents, file_id)
-                global total_com
-                total_com += 1
-        except:
-            continue
+        if not known_commit(commit, file_id):
+            try:
+                content_res = get_content("https://raw.githubusercontent.com/" +
+                    repo_full_name + "/" + commit['sha'] + "/" + file_path)
+            except Exception:
+                continue
+
+            # Extract only shas of parents from api response
+            parents = []
+            for p in commit['parents']:
+                parents.append(p['sha'])
+            insert_commit(commit, content_res, parents, file_id)
     
 
 #-------------------------------------------------------------------------------
@@ -356,7 +389,8 @@ def download_commits_from_page(commits_res, repo_full_name, file_path, file_id):
 # one if it doesn't exist yet. The database schema follows the GitHub API
 # response schema. Our 'insert_repo', 'insert_file' and 'insert_comit' functions
 # directly take a JSON response dictionary. 'commit' is a reserved keyword in 
-# sqlite, therefore the tablename is 'comit'.
+# sqlite, therefore the tablename is 'comit'. We also increase our 
+# counter for the sample sizes after each insertion.
 
 db = sqlite3.connect(args.database)
 db.executescript('''
@@ -393,9 +427,6 @@ db.executescript('''
     );
     ''')
 
-# We also count the commits that have already been downloaded
-total_com = int(db.execute("SELECT COUNT() FROM comit").fetchone()[0])
-
 def insert_repo(repo):
     db.execute('''
         INSERT OR IGNORE INTO repo 
@@ -414,6 +445,9 @@ def insert_repo(repo):
         , repo['owner']['login']
         ))
     db.commit()
+    global sam_repo, total_sam_repo
+    sam_repo += 1
+    total_sam_repo += 1
 
 # Here we insert a file into the results database. For further computations
 # we check the file_id after insertion and return it.
@@ -431,6 +465,9 @@ def insert_file(file,repo_id):
         ))
     file_id = local_cur.lastrowid
     db.commit()
+    global sam_file, total_sam_file
+    sam_file += 1
+    total_sam_file += 1
     return file_id
 
 # In order to get the byte size of the file content we check the length of the
@@ -453,6 +490,9 @@ def insert_commit(commit,content_res,parents,file_id):
         , file_id
         ))
     db.commit()
+    global sam_comit, total_sam_comit
+    sam_comit += 1
+    total_sam_comit += 1
 
 def known_file(item):
     cur = db.execute("select count(*) from file where path = ? and repo_id = ?",
@@ -468,15 +508,11 @@ def known_commit(item, file_id):
 
 # Now we can finally get into it! 
 
-# First, let's get an estimate of the total population.  Note that this is a
-# very, very unstable number that can not be relied upon!
-
-status_msg = 'Getting an estimate of the overall population...'
+status_msg = 'Initialize Program'
 print_footer()
-
-res = search(args.min_size, args.max_size)
-est_pop = int(res.json()['total_count'])
-total_sam = 0
+total_sam_repo = 0
+total_sam_file = 0
+total_sam_comit = 0
 
 # Before starting the iterative search process, let's see if we have a sampling
 # statistics file that we could use to continue a previous search. If so, let's
@@ -491,20 +527,27 @@ if os.path.isfile(args.statistics):
         for row in fr:
             strat_first = int(row[0])
             strat_last = int(row[1])
-            pop = int(row[2])
-            sam = int(row[3])
-            total_sam += sam
+            pop_files = int(row[2])
+            sam_repo = int(row[3])
+            sam_file = int(row[4])
+            sam_comit = int(row[5])
+            total_sam_repo += sam_repo
+            total_sam_file += sam_file
+            total_sam_comit += sam_comit
             clear_footer()
             print_stratum()
             print_footer()
-        if pop > -1:
+        if pop_files > -1:
             strat_first += args.stratum_size
             strat_last = min(strat_last + args.stratum_size, args.max_size)
-            pop = -1
-            sam = -1
+            pop_files = -1
+            sam_repo = -1
+            sam_file = -1
+            sam_comit = -1
 else:
     with open(args.statistics, 'w') as f:
-        f.write('stratum_first,stratum_last,population,sample\n')
+        f.write('stratum_first,stratum_last,population_file,sample_repo,sample_file,sample_comit\n')
+
 
 statsfile = open(args.statistics, 'a', newline='')
 stats = csv.writer(statsfile)
@@ -539,17 +582,15 @@ print_footer()
 # Iterating through all the strata, we want to sample as much as we can.
 
 while strat_first <= args.max_size:
-    
-    # We wait some time before calling the search query to avoid secondary rate limit.
-    # (The secondary rate limit blocks heavy search request if they come within short
-    # amount of time with a forbidden response.)
-    update_status('Buffering to avoid secondary rate limit error...')
-    time.sleep(60)
+
+    pop_files = 0
+    sam_repo = 0
+    sam_file = 0
+    sam_comit = 0
 
     update_status('Searching...')
     res = search(strat_first, strat_last)
-    pop = int(res.json()['total_count'])
-    sam = 0
+    pop_files = int(res.json()['total_count'])
     clear_footer()
     print_stratum(overwrite=True)
     print_footer()
@@ -561,7 +602,7 @@ while strat_first <= args.max_size:
     # from both ends, so to speak. This gives us a maximum sample size of 2000
     # per stratum.
 
-    if pop > 1000:
+    if pop_files > 1000:
         update_status('Repeating search with reverse sort order...')
         res = search(strat_first, strat_last, order='desc')
         
@@ -570,7 +611,7 @@ while strat_first <= args.max_size:
         # two population counts for this stratum as a conservative estimate.
 
         pop2 = int(res.json()['total_count'])
-        pop = max(pop,pop2)
+        pop_files = max(pop_files,pop2)
         clear_footer()
         print_stratum(overwrite=True)
         print_footer()
@@ -580,18 +621,21 @@ while strat_first <= args.max_size:
     # After we've sampled as much as we could of the current strata, commit it
     # to the table and move on to the next one.
 
-    stats.writerow([strat_first,strat_last,pop,sam])
+    stats.writerow([strat_first,strat_last,pop_files,sam_repo,sam_file,sam_comit])
     statsfile.flush()
     
     strat_first += args.stratum_size
     strat_last = min(strat_last + args.stratum_size, args.max_size)
-    pop = -1
-    sam = -1
+    pop_files = -1
+    sam_repo = -1
+    sam_file = -1
+    sam_comit = -1
 
     clear_footer()
     print_stratum()
     print_footer()
 
 update_status('Done.')
-print("The program took " + time.strftime("%H:%M:%S", time.gmtime((time.time())-start)) + " to execute (Hours:Minutes:Seconds).")
-print("The program has requested " + str(api_calls) + " API calls from github.\n\n")
+print("The program took " + time.strftime("%H:%M:%S", time.gmtime((time.time())-start)) + 
+    " to execute (Hours:Minutes:Seconds).")
+print("The program has requested " + str(api_calls) + " API calls from GitHub.\n\n")
