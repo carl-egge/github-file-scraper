@@ -446,6 +446,8 @@ db.executescript('''
     , full_name TEXT NOT NULL
     , description TEXT
     , url TEXT NOT NULL
+    , license TEXT
+    , language TEXT NOT NULL
     , fork INTEGER NOT NULL
     , owner_id INTEGER NOT NULL
     , owner_login TEXT NOT NULL
@@ -476,16 +478,17 @@ db.executescript('''
 def insert_repo(repo):
     db.execute('''
         INSERT OR IGNORE INTO repo 
-            ( repo_id, name, full_name, description, url, fork
-            , owner_id, owner_login
-            )
-        VALUES (?,?,?,?,?,?,?,?)
+            ( repo_id, name, full_name, description, url, license
+             , language, fork, owner_id, owner_login)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
         ''',
         ( repo['id']
         , repo['name']
         , repo['full_name']
         , repo['description']
         , repo['url']
+        , current_license
+        , args.language
         , int(repo['fork'])
         , repo['owner']['id']
         , repo['owner']['login']
