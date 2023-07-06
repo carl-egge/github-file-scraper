@@ -365,7 +365,7 @@ def download_repos_from_page(res):
                 continue
             
             for file in res.json()['tree']:
-                if(file['type'] == "blob" and bool(re.search(fr'\w\.sol$', file['path']))):
+                if(file['type'] == "blob" and file['path'].endswith(f'sol')): # bool(re.search(fr'\w\.{args.extension}$', file['path']))):
                     # Extract the file name from the path using regex
                     name_re = re.search(r'[\w-]+?(?=\.)', file['path'])
                     file['name'] = name_re.group(0) if name_re != None else file['path']
