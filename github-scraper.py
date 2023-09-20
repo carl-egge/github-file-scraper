@@ -25,7 +25,7 @@
 
 ############################  GITHUB FILE SCRAPER  #############################
 
-## VERSION: Search for Solidity Smart Contracts
+## VERSION: Search for Solidity Smart Contracts and Flatten them
 
 # This script is a modification of the github-searcher from Michael Schröder and
 # Jürgen Cito. It exhaustively samples GitHub Repo Search results and stores
@@ -34,9 +34,19 @@
 # Its main purpose is to build a local database of Solidity smart contracts and
 # their versions. It is structured in a semi-chronological, readable form.
 
+# TODO (Carl Egge):
+# - Add a function to flatten the Solidity files and store them in a separate file
+# - Add a function to extract the compiler version from the Solidity files
+# - use git clone or different method to download all Solidity files from a repo
+#   (must keep folder structure of repo)
+# - switch from sqlite to mongodb
+# - use flattener to flatten the downloaded Solidity files -> skip if fails
+# - clean up directory structure after each repository 
+
 import os, sys, argparse, shutil, time, signal, re
 import sqlite3, csv
 import requests
+import git
 
 # Before we get to the fun stuff, we need to parse and validate arguments, check
 # environment variables, set up the help text and so on.
@@ -319,6 +329,18 @@ def search(a,b,order='asc',license="no"):
     
     return get('https://api.github.com/search/repositories',
         params={'q': query, 'sort': 'updated', 'order': order, 'per_page': 100})
+
+
+# A function that downloads a GitHub repository into a specified directory.
+
+def download_github_repository(github_url, repo_dirc):
+    try:
+        # Clone the GitHub repository
+        repo = git.Repo.clone_from(github_url, repo_dirc)
+        return f"Repository '{repo.remote().url}' successfully cloned into '{repo_dirc}'."
+    except git.exc.GitCommandError as e:
+        return f"Failed to clone repository: {str(e)}"
+
 
 #-------------------------------------------------------------------------------
 
@@ -631,6 +653,11 @@ signal.signal(signal.SIGINT, signal_handler)
 clear_footer()
 print_stratum()
 print_footer()
+
+# Ensure the 'repo' directory exists
+repo_directory = "repo"
+if not os.path.exists(repo_directory):
+    os.makedirs(repo_directory)
 
 # Iterating through all the strata, we want to sample as much as we can.
 
