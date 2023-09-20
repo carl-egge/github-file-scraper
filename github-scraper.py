@@ -42,9 +42,10 @@
 # - switch from sqlite to mongodb
 # - use flattener to flatten the downloaded Solidity files -> skip if fails
 # - clean up directory structure after each repository 
+# - add license check
 
 import os, sys, argparse, shutil, time, signal, re
-import sqlite3, csv
+import sqlite3, csv, pymongo
 import requests
 import git
 
@@ -59,8 +60,11 @@ parser = argparse.ArgumentParser(
     description='''Exhaustively sample the GitHub Code Search API and 
 store files and commits of Solidity smart contracts.''')
 
-parser.add_argument('--database', metavar='FILE', default='results.db', 
-    help='search results database file (default: results.db)')
+# parser.add_argument('--database', metavar='FILE', default='results.db', 
+#    help='search results database file (default: results.db)')
+
+parser.add_argument('--database', metavar='STRING', default='mongodb://localhost:27017/', 
+    help='connection string for target mongodb database (default: mongodb://localhost:27017/)')
 
 parser.add_argument('--statistics', metavar='FILE', default='sampling.csv', 
     help='sampling statistics file (default: sampling.csv)')
@@ -165,6 +169,30 @@ licenses = ['apache-2.0', 'agpl-3.0', 'bsd-2-clause', 'bsd-3-clause', 'bsl-1.0',
             'mpl-2.0', 'unlicense']
 current_license = ''
 current_cumulative_pop = 0
+
+# Ensure the 'repo' directory exists
+repo_directory = "repo"
+if not os.path.exists(repo_directory):
+    os.makedirs(repo_directory)
+
+#-------------------------------------------------------------------------------
+# Connect to mongodb database
+
+try:
+    print(' > Trying to connect to MongoDB database: "%s"' % args.database)
+    # client = MongoClient('mongodb://<username>:<password>@<host>:<port>/')
+    mongo_client = pymongo.MongoClient(args.database)
+    mongo_client.server_info() # check if connection is successful
+except pymongo.errors.ServerSelectionTimeoutError as e:
+    error_string = 'MongoDB connection failed', str(e)
+    sys.exit(error_string)
+
+mongo_db = mongo_client.main_db
+mongo_collection = mongo_db.contracts
+
+sys.stdout.write('\033[F\r\033[J')
+print(' > Successfully connected to MongoDB database: "%s"' % args.database)
+
 
 #-------------------------------------------------------------------------------
 
@@ -378,22 +406,41 @@ def download_all_repos(res):
 def download_repos_from_page(res):
     update_status('Get list of files in repository...')
     for repo in res.json()['items']:
-        if not known_repo(repo):
-            insert_repo(repo)
-            try:
-                res = get("https://api.github.com/repos/" + repo["full_name"] 
-                        + "/git/trees/" + repo["default_branch"] + "?recursive=1")
-            except Exception:
-                continue
+        # if not known_repo(repo):
+        #     insert_repo(repo)
+        #     try:
+        #         res = get("https://api.github.com/repos/" + repo["full_name"] 
+        #                 + "/git/trees/" + repo["default_branch"] + "?recursive=1")
+        #     except Exception:
+        #         continue
             
-            for file in res.json()['tree']:
-                if(file['type'] == "blob" and file['path'].endswith(f'sol')): # bool(re.search(fr'\w\.{args.extension}$', file['path']))):
-                    # Extract the file name from the path using regex
-                    name_re = re.search(r'[\w-]+?(?=\.)', file['path'])
-                    file['name'] = name_re.group(0) if name_re != None else file['path']
-                    if not known_file(file, repo['id']):
-                        file_id = insert_file(file, repo['id'])
-                        download_all_commits(repo, file, file_id)
+        #     for file in res.json()['tree']:
+        #         if(file['type'] == "blob" and file['path'].endswith(f'sol')): # bool(re.search(fr'\w\.{args.extension}$', file['path']))):
+        #             # Extract the file name from the path using regex
+        #             name_re = re.search(r'[\w-]+?(?=\.)', file['path'])
+        #             file['name'] = name_re.group(0) if name_re != None else file['path']
+        #             if not known_file(file, repo['id']):
+        #                 file_id = insert_file(file, repo['id'])
+        #                 download_all_commits(repo, file, file_id)
+
+        # Download the repository into a folder
+        download_github_repository("https://api.github.com/" + repo["full_name"], repo_directory)
+
+        # Delete everything except the Solidity files
+        for root, dirs, files in os.walk(repo_directory):
+            for file in files:
+                if not file.endswith(f'sol'):
+                    os.remove(os.path.join(root, file))
+
+        # TODO: Flatten the Solidity files
+        print("Implementation unfinished!")
+
+        # Delete everything in the repo folder
+        for root, dirs, files in os.walk(repo_directory):
+            for file in files:
+                os.remove(os.path.join(root, file))
+            for dir in dirs:
+                shutil.rmtree(os.path.join(root, dir))
 
         clear_footer()
         print_stratum(overwrite=True)
@@ -409,169 +456,89 @@ def download_repos_from_page(res):
 # commit the file content is then downloaded from the Raw Github API that 
 # has no rate limit.
 
-def download_all_commits(repo, file, file_id):
-    try:
-        # Get the list of commits for this file
-        commits_url = repo['commits_url'][:-6].replace('#', '%23')
-        commits_res = get(commits_url, params={'path': file['path'], 'per_page': 100})
-    except Exception:
-        return
-    download_commits_from_page(commits_res, repo['full_name'],
-                                file['path'], file_id)
-    while 'next' in commits_res.links:
-        update_status('Getting next page of commits...')
-        commits_res = get(commits_res.links['next']['url'])
-        download_commits_from_page(commits_res, repo['full_name'],
-                                    file['path'], file_id)
-    update_status('')
+# def download_all_commits(repo, file, file_id):
+#     try:
+#         # Get the list of commits for this file
+#         commits_url = repo['commits_url'][:-6].replace('#', '%23')
+#         commits_res = get(commits_url, params={'path': file['path'], 'per_page': 100})
+#     except Exception:
+#         return
+#     download_commits_from_page(commits_res, repo['full_name'],
+#                                 file['path'], file_id)
+#     while 'next' in commits_res.links:
+#         update_status('Getting next page of commits...')
+#         commits_res = get(commits_res.links['next']['url'])
+#         download_commits_from_page(commits_res, repo['full_name'],
+#                                     file['path'], file_id)
+#     update_status('')
 
 
-def download_commits_from_page(commits_res, repo_full_name, file_path, file_id):
-    count_commits = str(len(commits_res.json())) if len(commits_res.json()) < 100 else "100+"
-    update_status('Downloading ' + count_commits + ' commits...')
-    for commit in commits_res.json():
-        if not known_commit(commit, file_id):
-            try:
-                content_res = get_content("https://raw.githubusercontent.com/" +
-                    repo_full_name + "/" + commit['sha'] + "/" + file_path)
-            except Exception:
-                continue
+# def download_commits_from_page(commits_res, repo_full_name, file_path, file_id):
+#     count_commits = str(len(commits_res.json())) if len(commits_res.json()) < 100 else "100+"
+#     update_status('Downloading ' + count_commits + ' commits...')
+#     for commit in commits_res.json():
+#         if not known_commit(commit, file_id):
+#             try:
+#                 content_res = get_content("https://raw.githubusercontent.com/" +
+#                     repo_full_name + "/" + commit['sha'] + "/" + file_path)
+#             except Exception:
+#                 continue
 
-            # Extract only shas of parents from api response
-            parents = []
-            for p in commit['parents']:
-                parents.append(p['sha'])
-            insert_commit(commit, content_res, parents, file_id)    
+#             # Extract only shas of parents from api response
+#             parents = []
+#             for p in commit['parents']:
+#                 parents.append(p['sha'])
+#             insert_commit(commit, content_res, parents, file_id)    
 
 #-------------------------------------------------------------------------------
-
-# This is a good place to open the connection to the results database, or create
-# one if it doesn't exist yet. The database schema follows the GitHub API
-# response schema. Our 'insert_repo', 'insert_file' and 'insert_comit' functions
-# help to store the items in the database respectively. 'commit' is a reserved 
-# keyword in sqlite, therefore the tablename is 'comit'. We also increase our 
-# counter for the sample sizes after each insertion.
-
-db = sqlite3.connect(args.database)
-db.executescript('''
-    CREATE TABLE IF NOT EXISTS repo 
-    ( repo_id INTEGER PRIMARY KEY
-    , name TEXT NOT NULL
-    , full_name TEXT NOT NULL
-    , description TEXT
-    , url TEXT NOT NULL
-    , fork INTEGER NOT NULL
-    , owner_id INTEGER NOT NULL
-    , owner_login TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS file
-    ( file_id INTEGER PRIMARY KEY
-    , name TEXT NOT NULL
-    , path TEXT NOT NULL
-    , sha TEXT NOT NULL
-    , repo_id INTEGER NOT NULL
-    , FOREIGN KEY (repo_id) REFERENCES repo(repo_id)
-    , UNIQUE(path,repo_id)
-    );
-    CREATE TABLE IF NOT EXISTS comit
-    ( comit_id INTEGER PRIMARY KEY
-    , sha TEXT NOT NULL
-    , message TEXT NOT NULL
-    , size INTEGER NOT NULL
-    , created DATETIME DEFAULT CURRENT_TIMESTAMP
-    , content TEXT NOT NULL
-    , compiler_version TEXT NOT NULL
-    , parents TEXT NOT NULL
-    , file_id INTEGER NOT NULL
-    , FOREIGN KEY (file_id) REFERENCES file(file_id)
-    , UNIQUE(sha,file_id)
-    );
-    ''')
-
-def insert_repo(repo):
-    db.execute('''
-        INSERT OR IGNORE INTO repo 
-            ( repo_id, name, full_name, description, url, fork
-            , owner_id, owner_login
-            )
-        VALUES (?,?,?,?,?,?,?,?)
-        ''',
-        ( repo['id']
-        , repo['name']
-        , repo['full_name']
-        , repo['description']
-        , repo['url']
-        , int(repo['fork'])
-        , repo['owner']['id']
-        , repo['owner']['login']
-        ))
-    db.commit()
-    global sam_repo, total_sam_repo
-    sam_repo += 1
-    total_sam_repo += 1
-
-# When inserting a file we check the file_id after insertion from the database
-# cursor and return it for further computations.
-
-def insert_file(file,repo_id):
-    local_cur = db.execute('''
-        INSERT OR IGNORE INTO file
-            (name, path, sha, repo_id)
-        VALUES (?,?,?,?)
-        ''',
-        ( file['name']
-        , file['path']
-        , file['sha']
-        , repo_id
-        ))
-    file_id = local_cur.lastrowid
-    db.commit()
+# Function to handle the insert into the mongodb collection
+# TODO: Implement this:
+def insert_document(item, repo_id):
+    # Check if duplicate exists
+    if known_file(item, repo_id):
+        return
+    # Build document
+    document = {
+        # "_id": { "$oid": "63f64e1cd56ad6d1d7c1a887" },
+        "name": "",
+        "path": "f_path",
+        "sha": "f_sha",
+        "language": "Solidity",
+        "license": "license",
+        "repo": {
+            "repo_id": repo_id,
+            "full_name": "full_name",
+            "description": "description",
+            "url": "url",
+            "owner_id": "owner_id"
+        },
+        "versions": []
+    }
+    # Insert into mongodb collection
+    inserted = mongo_collection.insert_one(document).inserted_id
+    if not inserted:
+        update_status('ERROR :: Inserting "%s" into MongoDB failed' % "please implement this")
+        time.sleep(1)
+        return
     global sam_file, total_sam_file
     sam_file += 1
     total_sam_file += 1
-    return file_id
+    return inserted
 
-# In order to get the byte size of the file content we check the length of the
-# content of the response object. The timestamp is stored as the string directly
-# from the API response, since sqlite can't store time objects anyway.
-# The parent field stores a list of git_shas that correspond to the parent commits.
 
-def insert_commit(commit,content_res,parents,file_id):
-    db.execute('''
-        INSERT OR IGNORE INTO comit
-            (sha, message, size, created, content, compiler_version, parents, file_id)
-        VALUES (?,?,?,?,?,?,?,?)
-        ''',
-        ( commit['sha']
-        , commit['commit']['message']
-        , len(content_res.content)
-        , commit['commit']['committer']['date']
-        , content_res.text
-        , find_compiler_version(content_res.text)
-        , str(parents)
-        , file_id
-        ))
-    db.commit()
-    global sam_comit, total_sam_comit
-    sam_comit += 1
-    total_sam_comit += 1
-
-def known_repo(item):
-    cur = db.execute("select count(*) from repo where full_name = ? and repo_id = ?",
-        (item['full_name'], item['id']))
-    return cur.fetchone()[0] == 1
+# Before we upload the data to the database we need to check if the file is already
+# in the database to avoid duplicates.
+# Usually the file sha uniquely identifies the file. However, if forks are included in 
+# the database, the same file sha can exist for different files. Therefore uniqueness
+# can only be guaranteed if the repo_id and the file sha are combined.
 
 def known_file(item, repo_id):
-    cur = db.execute("select count(*) from file where path = ? and repo_id = ?",
-        (item['path'], repo_id))
-    return cur.fetchone()[0] == 1
-    
+    duplicate = mongo_collection.find_one({"repo.repo_id": repo_id, "sha": item['sha']})
+    # duplicate_files += 1
+    # update_status('File "%s" already exists in MongoDB' % f_path)
+    return duplicate != None
 
-def known_commit(item, file_id):
-    cur = db.execute("select count(*) from comit where sha = ? and file_id = ?",
-        (item['sha'], file_id))
-    return cur.fetchone()[0] == 1
-
+# TODO: Redo this!
 # For convenience, we define a short function that uses a regex to get the 
 # compiler version of a Solidity file.
 
@@ -637,8 +604,7 @@ stats = csv.writer(statsfile)
 # database and statistic file.
 
 def signal_handler(sig,frame):
-    db.commit()
-    db.close()
+    mongo_client.close()
     statsfile.flush()
     statsfile.close()
     print("\nThe program took " + time.strftime("%H:%M:%S", 
@@ -653,11 +619,6 @@ signal.signal(signal.SIGINT, signal_handler)
 clear_footer()
 print_stratum()
 print_footer()
-
-# Ensure the 'repo' directory exists
-repo_directory = "repo"
-if not os.path.exists(repo_directory):
-    os.makedirs(repo_directory)
 
 # Iterating through all the strata, we want to sample as much as we can.
 
@@ -750,6 +711,7 @@ while strat_first <= args.max_size:
     print_stratum()
     print_footer()
 
+mongo_client.close()
 update_status('Done.')
 print("The program took " + time.strftime("%H:%M:%S", time.gmtime((time.time())-start)) + 
     " to execute (Hours:Minutes:Seconds).")
