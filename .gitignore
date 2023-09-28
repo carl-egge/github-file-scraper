@@ -3,3 +3,6 @@
 .env
 log.txt
 log/
+venv/
+env/
+repo/

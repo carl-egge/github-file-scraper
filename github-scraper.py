@@ -43,11 +43,19 @@
 # - use flattener to flatten the downloaded Solidity files -> skip if fails
 # - clean up directory structure after each repository 
 # - add license check
+# - maybe update find_compiler_version function
+
+# Idea: 
+# 1. Clone a repository into "repo" folder
+# 2. Find all Solidity files in the repository
+# 3. For each Solidity file, get the commit history
+# 4. For each commit, flatten the Solidity file
+# 5. Store the flattened content in the commit history
 
 import os, sys, argparse, shutil, time, signal, re
-import sqlite3, csv, pymongo
+import csv, pymongo
 import requests
-import git
+import git, subprocess
 
 # Before we get to the fun stuff, we need to parse and validate arguments, check
 # environment variables, set up the help text and so on.
@@ -59,9 +67,6 @@ parser = argparse.ArgumentParser(
     formatter_class=argparse.RawDescriptionHelpFormatter,
     description='''Exhaustively sample the GitHub Code Search API and 
 store files and commits of Solidity smart contracts.''')
-
-# parser.add_argument('--database', metavar='FILE', default='results.db', 
-#    help='search results database file (default: results.db)')
 
 parser.add_argument('--database', metavar='STRING', default='mongodb://localhost:27017/', 
     help='connection string for target mongodb database (default: mongodb://localhost:27017/)')
@@ -170,13 +175,17 @@ licenses = ['apache-2.0', 'agpl-3.0', 'bsd-2-clause', 'bsd-3-clause', 'bsl-1.0',
 current_license = ''
 current_cumulative_pop = 0
 
+# Display the current repository
+current_repo = ''
 # Ensure the 'repo' directory exists
 repo_directory = "repo"
 if not os.path.exists(repo_directory):
     os.makedirs(repo_directory)
 
 #-------------------------------------------------------------------------------
-# Connect to mongodb database
+# In order to store our results we must first connect to the results database.
+# In this version of the script we use a MongoDB database. We also create a
+# collection in the database to store our results.
 
 try:
     print(' > Trying to connect to MongoDB database: "%s"' % args.database)
@@ -188,10 +197,10 @@ except pymongo.errors.ServerSelectionTimeoutError as e:
     sys.exit(error_string)
 
 mongo_db = mongo_client.main_db
-mongo_collection = mongo_db.contracts
+mongo_collection = mongo_db.testcontracts
 
 sys.stdout.write('\033[F\r\033[J')
-print(' > Successfully connected to MongoDB database: "%s"' % args.database)
+print('\n > Successfully connected to MongoDB database: "%s"\n' % args.database)
 
 
 #-------------------------------------------------------------------------------
@@ -249,11 +258,12 @@ def print_footer():
     print()
     print('Current queried license: ', current_license) if args.licensed else print()
     print('Current GitHub ratelimit: %d / ~%d' % (rate_used, ratelimit))
+    print('Current repo: ', current_repo)
     print()
     print(status_msg)
 
 def clear_footer():
-    sys.stdout.write(f'\033[9F\r\033[J')
+    sys.stdout.write(f'\033[10F\r\033[J')
 
 # For convenience, we also have function for just updating the status message.
 # It returns the old message so it can be restored later if desired.
@@ -365,10 +375,32 @@ def download_github_repository(github_url, repo_dirc):
     try:
         # Clone the GitHub repository
         repo = git.Repo.clone_from(github_url, repo_dirc)
-        return f"Repository '{repo.remote().url}' successfully cloned into '{repo_dirc}'."
+        update_status(f"Repository '{repo.remote().url}' successfully cloned into '{repo_dirc}'.")
+        return repo
     except git.exc.GitCommandError as e:
-        return f"Failed to clone repository: {str(e)}"
+        update_status(f"Failed to clone repository: {str(e)}")
+        return False
+    
 
+# With this helper function we can check if a repository has a license that we can use.
+# We call the GitHub api for each repository and check if the license exists and if it
+# is in the list of hardcoded open source licenses.
+# This step is only necessary if the argument --check-repo-license is set to True.
+# We do not use the '/license' endpoint of GitHub because it returns a status 404 if the 
+# repository does not have a license.
+
+def check_license(repo_full_name):
+    licenses = ['apache-2.0', 'agpl-3.0', 'bsd-2-clause', 'bsd-3-clause', 'bsl-1.0',
+            'cc0-1.0', 'epl-2.0', 'gpl-2.0', 'gpl-3.0', 'lgpl-2.1', 'mit',
+            'mpl-2.0', 'unlicense']
+    res = get('https://api.github.com/repos/' + str(repo_full_name) + '')
+    if res.json()['license'] and res.json()['license']['key'] and res.json()['license']['key'] in licenses:
+        # global license
+        # license = res.json()['license']['key']
+        return True
+    else:
+        return False
+        
 
 #-------------------------------------------------------------------------------
 
@@ -384,10 +416,7 @@ def download_github_repository(github_url, repo_dirc):
 # reason, they are simply skipped over and count as not sampled.
 
 # DOWNLOAD REPOS
-# For each repository we request a list of files from the master branch and filter 
-# this list for Solidity files using the file extension (.sol).
-# Note: The limit for the tree array is 100,000 entries with a maximum size of 7 MB 
-# when getting the file list and using the recursive parameter.
+# First we define a function to download all repos from a page of search results.
 
 def download_all_repos(res):
     download_repos_from_page(res)
@@ -402,143 +431,223 @@ def download_all_repos(res):
             break
     update_status('')
 
+# We then loop over all repos on one page and do the following for each repo:
+# The repo is cloned into the 'repo' directory. Then we get a list of all Solidity
+# files in the repo and loop over them. For each file we get the commit history and
+# store it in the results database. If the repo is already in the database, we skip
+# it. If the repo has no license, we skip it. If the repo has only one commit, we skip
+# it. After handling all files in the repo, we delete the 'repo' directory to make
+# space for the next repo.
 
 def download_repos_from_page(res):
-    update_status('Get list of files in repository...')
     for repo in res.json()['items']:
-        # if not known_repo(repo):
-        #     insert_repo(repo)
-        #     try:
-        #         res = get("https://api.github.com/repos/" + repo["full_name"] 
-        #                 + "/git/trees/" + repo["default_branch"] + "?recursive=1")
-        #     except Exception:
-        #         continue
-            
-        #     for file in res.json()['tree']:
-        #         if(file['type'] == "blob" and file['path'].endswith(f'sol')): # bool(re.search(fr'\w\.{args.extension}$', file['path']))):
-        #             # Extract the file name from the path using regex
-        #             name_re = re.search(r'[\w-]+?(?=\.)', file['path'])
-        #             file['name'] = name_re.group(0) if name_re != None else file['path']
-        #             if not known_file(file, repo['id']):
-        #                 file_id = insert_file(file, repo['id'])
-        #                 download_all_commits(repo, file, file_id)
+        update_status(f"Working on repository '{repo['full_name']}'...")
+        global current_repo
+        current_repo = repo['full_name']
+        clear_footer()
+        print_footer()
 
+        # Delete everything in the ./repo directory
+        subdirectory_path = "./repo"
+        try:
+            # List all files and subdirectories in the subdirectory
+            subdirectory_contents = os.listdir(subdirectory_path)
+
+            # Iterate through the contents and remove each item
+            for item in subdirectory_contents:
+                item_path = os.path.join(subdirectory_path, item)
+                if os.path.isfile(item_path):
+                    os.unlink(item_path)
+                elif os.path.isdir(item_path):
+                    shutil.rmtree(item_path)
+            update_status(f"Successfully cleared contents of {subdirectory_path}.")
+        except OSError as e:
+            sys.exit(f"Error clearing contents of {subdirectory_path}: {e}")
+
+        # Double Check if the repository has a license
+        if args.licensed:
+            if not check_license(repo['full_name']):
+                update_status(f"Repository '{repo['full_name']}' has no license. Skipping processing.")
+                continue
+
+        # Check if the repository is already in the database
+        if mongo_collection.find_one({"repo.repo_id": repo['id']}) != None:
+            update_status(f"Repository '{repo['full_name']}' already in database. Skipping processing.")
+            continue
+        
         # Download the repository into a folder
-        download_github_repository("https://api.github.com/" + repo["full_name"], repo_directory)
+        try:
+            gitrepo = download_github_repository("https://github.com/" + repo["full_name"], repo_directory)
+        except git.exc.GitCommandError as e:
+            update_status(f"Error downloading repository: {e}")
+            continue
 
-        # Delete everything except the Solidity files
-        for root, dirs, files in os.walk(repo_directory):
-            for file in files:
-                if not file.endswith(f'sol'):
-                    os.remove(os.path.join(root, file))
+        # Check if the repository could be downloaded
+        if not gitrepo:
+            update_status(f"Repository '{repo['full_name']}' could not be downloaded. Skipping processing.")
+            continue
 
-        # TODO: Flatten the Solidity files
-        print("Implementation unfinished!")
+        # Switch to the default branch
+        default_branch = gitrepo.heads[0]
+        default_branch.checkout()
 
-        # Delete everything in the repo folder
-        for root, dirs, files in os.walk(repo_directory):
-            for file in files:
-                os.remove(os.path.join(root, file))
-            for dir in dirs:
-                shutil.rmtree(os.path.join(root, dir))
+        # Check if the repository has more than two commits
+        if len(list(gitrepo.iter_commits())) < 2:
+            update_status("Repository has only one commit. Skipping processing.")
+            continue
 
+        # Get a list of file_paths for all Solidity files in the repository
+        solidity_files = gitrepo.git.ls_files("*.sol").split("\n")
+        solidity_files = [file for file in solidity_files if file != '']
+
+        # Loop over all Solidity files and build db document
+        for file_path in solidity_files:
+            update_status(f"Working on file '{file_path}'...")
+            history = commit_history(repo_directory, file_path) #+ "/" + repo['name']
+            if len(history) < 2:
+                update_status("File has only one commit. Skipping processing.")
+                continue
+            fname = file_path.split("/")[-1][:-4]
+            document = {
+                # "_id": { "$oid": "63f64e1cd56ad6d1d7c1a887" },
+                "name": fname,
+                "path": file_path,
+                "sha": gitrepo.git.rev_parse(f"HEAD:{file_path}").strip(),
+                "language": "Solidity",
+                "license": current_license,
+                "repo": {
+                    "repo_id": repo['id'],
+                    "full_name": repo['full_name'],
+                    "description": repo['description'],
+                    "url": repo['url'],
+                    "owner_id": repo['owner']['id']
+                },
+                "versions": history
+            }
+
+            insert_document(document, repo['id'])
+
+        global sam_repo, total_sam_repo
+        sam_repo += 1
+        total_sam_repo += 1
         clear_footer()
         print_stratum(overwrite=True)
         print_footer()
         if sam_repo >= pop_repo:
             return
 
-# DOWNLOAD COMMITS
-# For each of the files a list of commits is requested from the Github API 
-# using the path as query on the commits endpoint.
-# The list of commits will again be paginated (with 100 elements per page).
-# Hence we loop over all pages and each of the commits on the pages. For a
-# commit the file content is then downloaded from the Raw Github API that 
-# has no rate limit.
+# Function to flatten a Solidity file using a npm flattener tool.
+# The flattener tool comes from https://github.com/poanetwork/solidity-flattener.
+# It stores the flattened content in a file in ./solidity-flattener/out.
 
-# def download_all_commits(repo, file, file_id):
-#     try:
-#         # Get the list of commits for this file
-#         commits_url = repo['commits_url'][:-6].replace('#', '%23')
-#         commits_res = get(commits_url, params={'path': file['path'], 'per_page': 100})
-#     except Exception:
-#         return
-#     download_commits_from_page(commits_res, repo['full_name'],
-#                                 file['path'], file_id)
-#     while 'next' in commits_res.links:
-#         update_status('Getting next page of commits...')
-#         commits_res = get(commits_res.links['next']['url'])
-#         download_commits_from_page(commits_res, repo['full_name'],
-#                                     file['path'], file_id)
-#     update_status('')
+def flatten_solidity_file(input_path):
+    try:
+        result = subprocess.run(["npm", "start", input_path], cwd="./solidity-flattener",
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        return result.stdout
+    except subprocess.CalledProcessError as e:
+        update_status(f"Error flattening Solidity file {input_path}: {e}")
+        return None
 
 
-# def download_commits_from_page(commits_res, repo_full_name, file_path, file_id):
-#     count_commits = str(len(commits_res.json())) if len(commits_res.json()) < 100 else "100+"
-#     update_status('Downloading ' + count_commits + ' commits...')
-#     for commit in commits_res.json():
-#         if not known_commit(commit, file_id):
-#             try:
-#                 content_res = get_content("https://raw.githubusercontent.com/" +
-#                     repo_full_name + "/" + commit['sha'] + "/" + file_path)
-#             except Exception:
-#                 continue
+# Function to get the commit history for a Solidity file
+# The commit history is stored in a list of dictionaries
+# For each commit we store the commit sha, the author, the date, the message, the parents
+# and the flattened content of the file at that commit.
 
-#             # Extract only shas of parents from api response
-#             parents = []
-#             for p in commit['parents']:
-#                 parents.append(p['sha'])
-#             insert_commit(commit, content_res, parents, file_id)    
+def commit_history(repo_path, file_path):
+    repo = git.Repo(repo_path)
+    commit_history = []
+
+    # Get the currently active branch (should be the default branch)
+    default_branch = repo.active_branch
+
+    vid = 0
+    for commit in repo.iter_commits(paths=file_path):
+        # update_status(f"Working on commit {commit.hexsha}")
+        commit_info = {
+            "version_id": vid,
+            "commit_sha": commit.hexsha,
+            "author": f"{commit.author.name} <{commit.author.email}>",
+            "date": commit.authored_datetime,
+            "message": commit.message.strip(),
+            "parents": [parent.hexsha for parent in commit.parents],
+            "compiler_version": None,  # To store the compiler version
+            "content": None  # To store the flattened content
+        }
+
+        # Checkout the commit to access the file at that specific commit
+        repo.git.checkout(commit)
+
+        # Attempt to flatten the file
+        flattener_output = flatten_solidity_file("../" + repo_path + "/" + file_path)
+
+        if flattener_output is not None:
+            # flattened_content is stored in ./solidity-flattener/out/
+            # The file name will be the original file name with _flat appended
+            flattened_file_name = file_path.split("/")[-1][:-4] + "_flat" + ".sol"
+            flattened_file_path = "./solidity-flattener/out/" + flattened_file_name
+
+            # Read the flattened content from the file
+            with open(flattened_file_path, "r") as flattened_file:
+                flattened_content = flattened_file.read()
+                commit_info["content"] = flattened_content
+            
+            compiler_version = find_compiler_version(flattened_content)
+            commit_info["compiler_version"] = compiler_version
+
+            # Append commit to the history        
+            commit_history.append(commit_info)
+            vid += 1
+            global sam_comit, total_sam_comit
+            sam_comit += 1
+            total_sam_comit += 1
+
+        # After appending the commit, the out/ directory is cleared
+        # This is done to avoid any conflicts with the next commit that will be checked out
+        try:
+            # List all files and subdirectories in the subdirectory
+            subdirectory_contents = os.listdir("./solidity-flattener/out")
+            # Iterate through the contents and remove each item
+            for item in subdirectory_contents:
+                item_path = os.path.join("./solidity-flattener/out", item)
+                if os.path.isfile(item_path):
+                    os.unlink(item_path)
+                elif os.path.isdir(item_path):
+                    shutil.rmtree(item_path)
+        except OSError as e:
+            update_status(f"Error clearing contents of out/ directory: {e}")
+    
+    # Check out the default branch and set back to HEAD
+    default_branch.checkout()
+
+    return commit_history
 
 #-------------------------------------------------------------------------------
-# Function to handle the insert into the mongodb collection
-# TODO: Implement this:
-def insert_document(item, repo_id):
-    # Check if duplicate exists
-    if known_file(item, repo_id):
+# This function helps to insert a document into the mongodb collection.
+# It checks if the document is already in the database and if not inserts it.
+# If the document is already in the database it prints an error message.
+
+def insert_document(document, repo_id):
+    # Check for duplicate documents in the database
+    # Usually the file sha uniquely identifies the file. However, if forks are included in 
+    # the database, the same file sha can exist for different files. Therefore uniqueness
+    # can only be guaranteed if the repo_id and the file sha are combined.
+    duplicate = mongo_collection.find_one({"repo.repo_id": repo_id, "sha": document['sha']})
+    if duplicate != None:
+        update_status('File "%s" already exists in MongoDB' % document['path'])
         return
-    # Build document
-    document = {
-        # "_id": { "$oid": "63f64e1cd56ad6d1d7c1a887" },
-        "name": "",
-        "path": "f_path",
-        "sha": "f_sha",
-        "language": "Solidity",
-        "license": "license",
-        "repo": {
-            "repo_id": repo_id,
-            "full_name": "full_name",
-            "description": "description",
-            "url": "url",
-            "owner_id": "owner_id"
-        },
-        "versions": []
-    }
+    
     # Insert into mongodb collection
     inserted = mongo_collection.insert_one(document).inserted_id
     if not inserted:
-        update_status('ERROR :: Inserting "%s" into MongoDB failed' % "please implement this")
-        time.sleep(1)
+        update_status('ERROR :: Inserting "%s" into MongoDB failed' % document['path'])
         return
     global sam_file, total_sam_file
     sam_file += 1
     total_sam_file += 1
     return inserted
 
-
-# Before we upload the data to the database we need to check if the file is already
-# in the database to avoid duplicates.
-# Usually the file sha uniquely identifies the file. However, if forks are included in 
-# the database, the same file sha can exist for different files. Therefore uniqueness
-# can only be guaranteed if the repo_id and the file sha are combined.
-
-def known_file(item, repo_id):
-    duplicate = mongo_collection.find_one({"repo.repo_id": repo_id, "sha": item['sha']})
-    # duplicate_files += 1
-    # update_status('File "%s" already exists in MongoDB' % f_path)
-    return duplicate != None
-
-# TODO: Redo this!
 # For convenience, we define a short function that uses a regex to get the 
 # compiler version of a Solidity file.
 
