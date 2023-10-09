@@ -197,7 +197,7 @@ except pymongo.errors.ServerSelectionTimeoutError as e:
     sys.exit(error_string)
 
 mongo_db = mongo_client.main_db
-mongo_collection = mongo_db.testcontracts
+mongo_collection = mongo_db.flatcontracts
 
 sys.stdout.write('\033[F\r\033[J')
 print('\n > Successfully connected to MongoDB database: "%s"\n' % args.database)
@@ -552,7 +552,7 @@ def flatten_solidity_file(input_path):
 
 # Function to get the commit history for a Solidity file
 # The commit history is stored in a list of dictionaries
-# For each commit we store the commit sha, the author, the date, the message, the parents
+# For each commit we store the commit sha, the date, the message, the parents
 # and the flattened content of the file at that commit.
 
 def commit_history(repo_path, file_path):
@@ -567,13 +567,14 @@ def commit_history(repo_path, file_path):
         # update_status(f"Working on commit {commit.hexsha}")
         commit_info = {
             "version_id": vid,
-            "commit_sha": commit.hexsha,
-            "author": f"{commit.author.name} <{commit.author.email}>",
-            "date": commit.authored_datetime,
+            "sha": commit.hexsha,
             "message": commit.message.strip(),
-            "parents": [parent.hexsha for parent in commit.parents],
+            "size": 0,
+            "created": commit.authored_datetime,
             "compiler_version": None,  # To store the compiler version
+            "parents": str([parent.hexsha for parent in commit.parents]),
             "content": None  # To store the flattened content
+            # "author": f"{commit.author.name} <{commit.author.email}>",
         }
 
         # Checkout the commit to access the file at that specific commit
@@ -588,10 +589,15 @@ def commit_history(repo_path, file_path):
             flattened_file_name = file_path.split("/")[-1][:-4] + "_flat" + ".sol"
             flattened_file_path = "./solidity-flattener/out/" + flattened_file_name
 
+            if not os.path.isfile(flattened_file_path):
+                update_status(f"Could not find flattened file {flattened_file_path}")
+                continue
+
             # Read the flattened content from the file
             with open(flattened_file_path, "r") as flattened_file:
                 flattened_content = flattened_file.read()
                 commit_info["content"] = flattened_content
+                commit_info["size"] = len(flattened_content)
             
             compiler_version = find_compiler_version(flattened_content)
             commit_info["compiler_version"] = compiler_version
