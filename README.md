@@ -1,14 +1,20 @@
-# Github Solidity Scraper
+# Github Solidity Scraper (Version 2)
 
-> A tool to collect and store Solidity files, their version history and some metadata from public GitHub repositories.
+> A tool to collect and store Solidity files, their version history and some metadata from public GitHub repositories. This Version of the script clones repositories and and will only add source code to the dataset that could be flattened.
 
-## Explanation of Branches
+## Explanation of Branches/Versions of the Script
 
-This **search-solidity-repos** branch is specifically for creating a database of Solidity smart contracts. The search logic is the same as in the search-licensed-repos branch and again it can be filtered for licenses. The results database will contain Solidity files and their commit history.
-
+### Master (Version 0)
 The **master** uses the GitHub endpoint for general code search (https://api.github.com/search/code). An arbitrary query can be given and the script stores the files from the response set and their commit history.
 
+### Search-Licensed-Repos (Version 1a)
 The **search-licensed-repos** branch has a different search logic that uses the GitHub endpoint for search repositories (https://api.github.com/search/repositories). A desired programming language and the corresponding extension must be provided and the script searches for repositories with this language. It then downloads all files from all repositories in the reponse set that are written in the specified programming language and also their entire commit history. In this version of the script the search results can be filtered for licenses.
+
+### Search-Solidity-Repos (Version 1b)
+The **search-solidity-repos** branch is specifically for creating a database of Solidity smart contracts. The search logic is the same as in the search-licensed-repos branch and again it can be filtered for licenses. The results database will contain Solidity files and their commit history.
+
+### Version2-Solidity-Scraper (Version 2)
+The **version2-solidity-scraper** branch implements again a different search logic that works by pull repositories the the local directory. The script fetches licensed repositories with Solidity code from the endpoint https://api.github.com/search/repositories and runs over the result list. Each repository is cloned in the local file system. Then using git directly the script finds that Solidity files in the cloned repository. The script stores only these Solidity files that can be flattened and that have multiple versions that can also be flattened. For the flattening currently the tool https://github.com/poanetwork/solidity-flattener is used. The resulting Solidity SCs and their source code history is stored directly in the local MongoDB collection. Before the next repository gets cloned into the file system old one gets deleted.
 
 ## Key features
 
@@ -20,15 +26,16 @@ The **search-licensed-repos** branch has a different search logic that uses the 
 - The search results can be filtered according to various criteria
   - If specified the script will only include data that falls under open source licenses in order to avoid copyright issues
   - You can also decide whether or not to include forks in the search
-- The script is built using [Python](https://docs.python.org/3/) and the [requests](https://pypi.org/project/requests/) package
+- The script is built using [Python](https://docs.python.org/3/) and the _requests_ and _gitpython_ package.
 
 **Script Steps**
 
 1. Stratified Search on GitHub Search API
-2. For each repository collect files
+2. For each repository clone it into file system
 3. For each file collect commit history
-4. For each commit get content
-5. Store in local sqlite database
+4. For each commit try to flatten file using the repo
+5. Build document with flattened commit history of source code
+6. Add document to local MongoDB instance
 
 ## How To Use
 
@@ -43,6 +50,9 @@ $ git clone https://github.com/carl-egge/github-file-scraper.git
 # Go into the repository
 $ cd github-file-scraper
 
+# Switch to branch
+$ git switch version2-solidity-scraper
+
 # Install dependencies
 $ python3 -m pip install -r requirements.txt
 
@@ -56,7 +66,7 @@ $ python3 github-scraper.py [--github-token TOKEN]
 To customize the script manually you can use arguments and control the behavior. It is strongly recommended to state a GitHub access token using the `github-token` argument.
 <br>
 
-- `--database` : Specify the name of the database file that the results will be stored in (default: results.db)
+- `--database` : Specify the connection string of the MongoDB instance that the results will be stored in (default: mongodb://localhost:27017/)
 - `--statistics` : Specify a name for a spreadsheet file that is used to store the sampling statistics. This file can be used to continue a previous search if the script get interrupted or throws an exception (default: sampling.csv)
 - `--stratum-size` : This is the length of the size ranges into which the search population is partitioned (default: 5)
 - `--min-size` : The minimum code size that is searched for (default: 1)
@@ -74,32 +84,7 @@ To customize the script manually you can use arguments and control the behavior.
 
 ## Smart Contract Repository
 
-**The results.db:**
-The output of the script will be a [SQLite](https://www.sqlite.org/index.html) database that consits of three tables: repo, file and comit. These tables store the information that the script collects.
-
-- _repo:_ This table holds data about the repositories that were found (e.g. `url`, `path`, `owner` ...)
-- _file:_ This table contains data about the Solidity files that were found (e.g. `path`, `sha` ...)
-  - The `repo_id` is a foreign key and is associated to the repo that the file was found in.
-- _comit:_ The commits correspond to a file and are stored together with some metadata in this table. This table also holds the actual file content from a commit. (e.g. `sha`, `message`, `content`, `file_id` ...)
-  - The `file_id` is a foreign key and is associated to the file that the commit corresponds to.
-  - Commit is a reserved keyword in SQLite therefore the tablename is `comit` with one `m`.
-
-<br>
-
-**Look At The Data:**
-In order to view and analyse the data a SQLite interface is needed. If not yet installed you can use one of many free online graphical user interfaces like ...
-
-- https://sqliteonline.com/
-- https://sqliteviewer.app/
-
-or you can download a free database interface such as ...
-
-- [DBeaver](https://dbeaver.io/)
-- [Adminer](https://www.adminer.org/).
-
-Feel free to use any tool you want to look at the output data.
-
-<br>
+A large dataset of Solidity Smart Contracts that has been collected using this scraper tool can be found under https://scr.ide.tuhh.de/. Please check this site to find out more about the result set and the ouput format of the script.
 
 ## License
 
