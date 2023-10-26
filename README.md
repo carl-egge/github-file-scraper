@@ -1,14 +1,20 @@
 # Github File Scraper
 
-> A tool to query source code files, their version history and some metadata from public GitHub repositories into a local sqlite3 database. Based on the github-searcher tool from ipa-lab.
+> A tool to query source code files, their version history and some metadata from public GitHub repositories into a local database. Based on the github-searcher tool from ipa-lab.
 
-## Explanation of Branches
+## Explanation of Branches/Versions of the Script
 
+### Master (Version 0)
 The **master** uses the GitHub endpoint for general code search (https://api.github.com/search/code). An arbitrary query can be given and the script stores the files from the response set and their commit history.
 
+### Search-Licensed-Repos (Version 1a)
 The **search-licensed-repos** branch has a different search logic that uses the GitHub endpoint for search repositories (https://api.github.com/search/repositories). A desired programming language and the corresponding extension must be provided and the script searches for repositories with this language. It then downloads all files from all repositories in the reponse set that are written in the specified programming language and also their entire commit history. In this version of the script the search results can be filtered for licenses.
 
+### Search-Solidity-Repos (Version 1b)
 The **search-solidity-repos** branch is specifically for creating a database of Solidity smart contracts. The search logic is the same as in the search-licensed-repos branch and again it can be filtered for licenses. The results database will contain Solidity files and their commit history.
+
+### Version2-Solidity-Scraper (Version 2)
+The **version2-solidity-scraper** branch implements again a different search logic that works by pull repositories the the local directory. The script fetches licensed repositories with Solidity code from the endpoint https://api.github.com/search/repositories and runs over the result list. Each repository is cloned in the local file system. Then using git directly the script finds that Solidity files in the cloned repository. The script stores only these Solidity files that can be flattened and that have multiple versions that can also be flattened. For the flattening currently the tool https://github.com/poanetwork/solidity-flattener is used. The resulting Solidity SCs and their source code history is stored directly in the local MongoDB collection. Before the next repository gets cloned into the file system old one gets deleted.
 
 ## Key features
 
